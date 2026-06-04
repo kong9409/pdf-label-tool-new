@@ -135,13 +135,73 @@ def extract_sku_and_qty(page: fitz.Page) -> Tuple[str, int]:
     return (sku or "UNKNOWN-SKU", qty)
 
 
-def clean_company_suffix(page: fitz.Page) -> None:
-    """Remove whatever appears after the destination FBA: / FBA： prefix.
+def find_destination_repair_clips(page: fitz.Page) -> List[fitz.Rect]:
+    """Return tight clips for labels that must stay visually intact.
 
-    This handles English, Chinese, pinyin, and mixed company/address text, without
-    relying on one fixed company name. It keeps the "FBA:" prefix and only paints
-    the suffix band on that same line. The overlay is limited to the left-side
-    destination block so it will not touch the right-side ship-from block.
+    We later paste these clips from the ORIGINAL page onto the processed page.
+    This makes the repaired text use the original PDF glyphs/font, so it does not
+    look like a newly typed patch.
+    """
+    clips: List[fitz.Rect] = []
+    page_w = page.rect.width
+    page_h = page.rect.height
+
+    for token in ("目的地：", "目的地:", "目的地"):
+        try:
+            rects = page.search_for(token)
+        except Exception:
+            rects = []
+        for r in rects:
+            if r.x0 < page_w * 0.35 and r.y0 < page_h * 0.45:
+                clips.append(fitz.Rect(max(0, r.x0 - 0.8), max(0, r.y0 - 0.8), min(page_w, r.x1 + 1.0), min(page_h, r.y1 + 1.0)))
+                break
+        if clips:
+            break
+
+    # For the destination FBA line, only preserve the FBA letters, not the colon.
+    prefix_rects = []
+    for token in ("FBA:", "FBA："):
+        try:
+            prefix_rects.extend(page.search_for(token))
+        except Exception:
+            pass
+    for r in prefix_rects:
+        if r.x0 < page_w * 0.35 and r.y0 < page_h * 0.45:
+            # Use the exact FBA-letter rect when possible. This avoids pasting the
+            # colon back while keeping all three FBA letters complete.
+            fba_letters = find_fba_letters_rect(page, r)
+            clips.append(fitz.Rect(max(0, fba_letters.x0 - 0.4), max(0, fba_letters.y0 - 0.6), min(page_w, fba_letters.x1 - 0.05), min(page_h, fba_letters.y1 + 0.6)))
+            break
+    return clips
+
+
+def find_fba_letters_rect(page: fitz.Page, prefix_rect: fitz.Rect) -> fitz.Rect:
+    """Find the tight rectangle of the FBA letters inside/near an FBA: prefix."""
+    best = None
+    best_score = 1e9
+    try:
+        rects = page.search_for("FBA")
+    except Exception:
+        rects = []
+    for rr in rects:
+        # Same visual row and close x position.
+        score = abs(rr.y0 - prefix_rect.y0) + abs(rr.x0 - prefix_rect.x0)
+        if score < best_score and abs(rr.y0 - prefix_rect.y0) < max(3.0, prefix_rect.height):
+            best = rr
+            best_score = score
+    if best is not None:
+        return best
+    # Fallback: keep most of the prefix width. Latin colon is usually narrow;
+    # Chinese colon is wider, but this still preserves FBA better than 0.72.
+    return fitz.Rect(prefix_rect.x0, prefix_rect.y0, prefix_rect.x0 + prefix_rect.width * 0.88, prefix_rect.y1)
+
+
+def clean_company_suffix(page: fitz.Page) -> None:
+    """Horizontally remove the destination content after FBA.
+
+    Important: remove the colon too. The result should visually be only "FBA"
+    on that line. The erase band is a very narrow same-line rectangle so it will
+    not touch the line above (目的地) or the warehouse code below (LAS1 / XLX7 / etc.).
     """
     prefixes = []
     for token in ("FBA:", "FBA："):
@@ -154,18 +214,18 @@ def clean_company_suffix(page: fitz.Page) -> None:
     page_h = page.rect.height
     for r in prefixes:
         # Only clean destination block occurrences: left side, upper half.
-        # Avoid shipment status bars / other incidental occurrences.
         if r.x0 > page_w * 0.35 or r.y0 > page_h * 0.45:
             continue
-        # Keep the FBA/FBA: characters intact. Start slightly after the colon.
-        x0 = min(r.x1 + 0.2, page_w * 0.48)
-        # Left destination block usually ends before the page midpoint.
-        x1 = min(page_w * 0.48, r.x1 + page_w * 0.38)
+        # Keep only the FBA letters; erase the colon and everything to the right.
+        fba_letters = find_fba_letters_rect(page, r)
+        x0 = min(fba_letters.x1 - 0.02, page_w * 0.60)
+        # Destination block ends before the middle/right ship-from block.
+        x1 = min(page_w * 0.56, r.x0 + page_w * 0.55)
         if x1 <= x0:
             continue
-        # Tight vertical band. Do not extend down to warehouse code line.
-        y0 = r.y0 - 0.2
-        y1 = min(r.y1 + 0.35, r.y0 + 10.5)
+        # Same-line horizontal erase only. Keep vertical padding tiny.
+        y0 = max(0, r.y0 - 0.35)
+        y1 = min(page_h, r.y1 + 0.35)
         rr = fitz.Rect(x0, y0, x1, y1)
         shape = page.new_shape()
         shape.draw_rect(rr)
@@ -182,6 +242,12 @@ def make_output_page(src_doc: fitz.Document, page_index: int, size_key: str, add
     tmp = fitz.open()
     tmp.insert_pdf(src_doc, from_page=page_index, to_page=page_index)
     page = tmp[0]
+
+    # Capture tiny clips from the ORIGINAL page before erasing. These are pasted
+    # back later to guarantee 目的地 and FBA stay complete and use the original glyphs.
+    original_page = src_doc[page_index]
+    repair_clips = find_destination_repair_clips(original_page)
+
     clean_company_suffix(page)
 
     src_w, src_h = page.rect.width, page.rect.height
@@ -192,6 +258,13 @@ def make_output_page(src_doc: fitz.Document, page_index: int, size_key: str, add
     out = fitz.open()
     out_page = out.new_page(width=target_w, height=target_h)
     out_page.show_pdf_page(fitz.Rect(0, 0, target_w, target_h), tmp, 0, clip=clip, keep_proportion=False)
+
+    # Paste back the preserved original labels after cleaning. Because we paste
+    # from the source PDF, font/spacing stays visually identical.
+    for rc in repair_clips:
+        if rc.y1 <= clip.y1:
+            dst = fitz.Rect(rc.x0 * scale, rc.y0 * scale, rc.x1 * scale, rc.y1 * scale)
+            out_page.show_pdf_page(dst, src_doc, page_index, clip=rc, keep_proportion=False, overlay=True)
 
     if add_made:
         # PyMuPDF's insert_textbox may silently skip text when the box is tight
