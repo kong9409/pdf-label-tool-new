@@ -29,11 +29,11 @@
   <div class="card">
     <h2 style="margin:0 0 12px;font-size:20px">功能说明</h2>
     <div class="features">
-      <div class="feature"><strong>1. 清理信息</strong><span>去掉目的地中 FBA: 后面的英文/中文地址或公司名，保留 FBA/FBA:、仓库代码和周围版式。</span></div>
+      <div class="feature"><strong>1. 清理信息</strong><span>去掉 FBA 后面的公司名字，保留 FBA 和周围版式。</span></div>
       <div class="feature"><strong>2. 尺寸裁剪</strong><span>裁剪尺寸可选择 10×8、10×10、10×15cm。</span></div>
       <div class="feature"><strong>3. Made In China</strong><span>可自行选择是否在每页底部添加 Made In China。</span></div>
-      <div class="feature"><strong>4. 合并规则</strong><span>同 SellerSKU 多个货件可选择合并生成同一个 PDF；不同 SellerSKU 会分开输出。</span></div>
-      <div class="feature"><strong>5. 文件命名</strong><span>按 SellerSKU 合并时，文件名格式为 SellerSKU-数量只.pdf；只有一个 SellerSKU 也使用该命名。</span></div>
+      <div class="feature"><strong>4. 合并规则</strong><span>同 SellerSKU 多个货件可选择合并生成同一个 PDF。</span></div>
+      <div class="feature"><strong>5. 文件命名</strong><span>按 SellerSKU 合并时，文件名格式为 SellerSKU-数量只.pdf。</span></div>
     </div>
   </div>
 
@@ -89,7 +89,7 @@ inspectBtn.onclick=async()=>{
     if(!res.ok||data.error)throw new Error(data.error||'识别失败');
     log(`识别完成：共 ${data.total_pages} 页，SellerSKU 分组 ${data.groups.length} 个`);
     data.groups.forEach(g=>append(`${g.sku}：${g.qty}只`));
-    if(data.groups.length===1&&data.groups[0].sku==='UNKNOWN-SKU')append('提示：未识别到 SellerSKU。请确认 PDF 文本中存在 “Single SKU” 和下一行 SellerSKU；若是截图型 PDF，请使用原始可识别 PDF。');
+    if(data.groups.length===1&&data.groups[0].sku==='UNKNOWN-SKU')append('提示：未识别到 SellerSKU，请确认上传的是原始可识别 PDF。');
   }catch(e){log('识别失败：'+e.message)}finally{inspectBtn.disabled=false;processBtn.disabled=false}
 }
 processBtn.onclick=async()=>{

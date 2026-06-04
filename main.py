@@ -16,21 +16,17 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 CM_TO_PT = 72 / 2.54
-REMOVE_SUFFIXES = [
-    ": Chaozhou Zero to One Cultural Media Co., Ltd",
-    "Chaozhou Zero to One Cultural Media Co., Ltd",
-]
+# Do not hard-code one company name. The tool removes whatever appears
+# after the destination "FBA:" / "FBA：" prefix on that same line.
 SIZE_MAP = {
     "10x8": (10.0, 8.0),
     "10x10": (10.0, 10.0),
     "10x15": (10.0, 15.0),
 }
-SKU_PATTERNS = [
-    re.compile(r"\bFD-[A-Z0-9][A-Z0-9\-]*\b"),
-    re.compile(r"\b[A-Z]{1,8}-US-[A-Z0-9][A-Z0-9\-]*\b"),
-    re.compile(r"\b[A-Z0-9]{2,}[A-Z0-9\-]*-US\b"),
-]
-SKU_LINE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-]{2,80}$")
+# Broad SellerSKU pattern. Real labels include variants such as:
+# FD-US-SD4-AH-BN4875, FD-US-8D-3-4871-S, FDM888A-FX-US.
+SKU_TOKEN_PATTERN = re.compile(r"(?<![A-Z0-9])[A-Z0-9][A-Z0-9-]{3,}(?![A-Z0-9])")
+FBA_SHIPMENT_PATTERN = re.compile(r"^FBA[0-9A-Z]{8,}U\d+$")
 INVALID_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|]+')
 
 app = FastAPI(title="PDF Label Tool")
@@ -45,32 +41,6 @@ def safe_name(name: str) -> str:
 
 def cm_to_pt(v: float) -> float:
     return v * CM_TO_PT
-
-
-def normalize_token(text: str) -> str:
-    return re.sub(r"\s+", "", (text or "").strip())
-
-
-def is_sku_candidate(text: str) -> bool:
-    t = normalize_token(text)
-    if not t:
-        return False
-    bad_keywords = ["数量", "SingleSKU", "MadeInChina", "Created:", "FBA", "请不要遮住", "目的地", "发货地"]
-    if any(k.lower() in t.lower() for k in bad_keywords):
-        return False
-    if re.search(r"[\u4e00-\u9fff]", t):
-        return False
-    if not SKU_LINE_RE.match(t):
-        return False
-    # SellerSKU usually contains at least one hyphen or both letters and digits.
-    has_letter = bool(re.search(r"[A-Za-z]", t))
-    has_digit = bool(re.search(r"\d", t))
-    if "-" not in t and not (has_letter and has_digit):
-        return False
-    # Exclude Amazon FBA shipment/carton ids.
-    if re.match(r"^FBA[A-Z0-9]+$", t, re.I):
-        return False
-    return True
 
 
 def extract_lines(page: fitz.Page) -> List[str]:
@@ -91,106 +61,116 @@ def extract_lines(page: fitz.Page) -> List[str]:
     return [t for _, _, t in sorted(rows)]
 
 
+def normalize_sku_candidate(text: str) -> str:
+    """Return a clean SellerSKU candidate or an empty string.
+
+    We deliberately do NOT require '-US-' because some SellerSKU values end with
+    '-US' (for example FDM888A-FX-US). We only reject known non-SKU label tokens.
+    """
+    t = re.sub(r"\s+", "", text.strip().upper())
+    t = t.strip("：:;,.，。")
+    if not t:
+        return ""
+    if t.startswith("FBA") or FBA_SHIPMENT_PATTERN.match(t):
+        return ""
+    if t in {"SINGLESKU", "SKU", "MADEINCHINA"}:
+        return ""
+    if "数量" in t or t.startswith("QTY") or t.startswith("COUNT"):
+        return ""
+    # Need a SKU-like token: enough length, alnum, usually has a hyphen.
+    m = SKU_TOKEN_PATTERN.search(t)
+    if not m:
+        return ""
+    candidate = m.group(0)
+    # Avoid picking simple warehouse codes or product short names like LAS1 / 888A.
+    if "-" not in candidate and not candidate.startswith(("FD", "FDM", "SKU")):
+        return ""
+    if len(candidate) < 5:
+        return ""
+    return candidate
+
+
 def extract_sku_and_qty(page: fitz.Page) -> Tuple[str, int]:
     lines = extract_lines(page)
     sku = ""
     qty = 1
 
-    # Strong rule: SellerSKU is the first valid code line after "Single SKU".
-    # This supports both formats such as FD-US-SD4-AH-BN4875 and FDM888A-FX-US.
+    # 1) Strong rule: the SellerSKU is the next meaningful line after "Single SKU".
     for i, line in enumerate(lines):
         if "Single SKU" in line:
+            after = line.split("Single SKU", 1)[1].strip()
+            direct = normalize_sku_candidate(after)
+            if direct:
+                sku = direct
+                break
             for candidate in lines[i + 1 : i + 10]:
-                cand = normalize_token(candidate)
-                if "数量" in candidate or cand.lower().startswith("madeinchina"):
+                if "数量" in candidate or candidate.lower().startswith("made in"):
                     break
-                if is_sku_candidate(cand):
+                cand = normalize_sku_candidate(candidate)
+                if cand:
                     sku = cand
                     break
-            if sku:
+            break
+
+    # 2) Fallback: scan all lines, but reject FBA shipment IDs and warehouse codes.
+    if not sku:
+        for line in lines:
+            cand = normalize_sku_candidate(line)
+            if cand:
+                sku = cand
                 break
 
-    # Regex fallback from the complete text, in case line reconstruction changes.
-    if not sku:
-        full_text = "\n".join(lines)
-        m = re.search(r"Single\s*SKU\s*\n\s*([^\n\r]+)\s*\n\s*数量", full_text, re.I)
-        if m and is_sku_candidate(m.group(1)):
-            sku = normalize_token(m.group(1))
-
-    # Older fallback: SKU-looking tokens anywhere, but avoid choosing FBA shipment IDs.
-    if not sku:
-        full = normalize_token("\n".join(lines))
-        candidates = []
-        for pat in SKU_PATTERNS:
-            candidates.extend(pat.findall(full))
-        candidates = [c for c in candidates if is_sku_candidate(c)]
-        if candidates:
-            sku = sorted(set(candidates), key=lambda x: (-len(x), x))[0]
-
+    # Quantity: supports "数量 6", "数量:6", or quantity on the next line.
     for i, line in enumerate(lines):
         if "数量" in line:
-            m = re.search(r"数量\s*(\d+)", line)
+            m = re.search(r"数量\s*[:：]?\s*(\d+)", line)
             if m:
                 qty = int(m.group(1))
-            elif i + 1 < len(lines) and lines[i + 1].isdigit():
-                qty = int(lines[i + 1])
+            elif i + 1 < len(lines):
+                m2 = re.search(r"\b(\d+)\b", lines[i + 1])
+                if m2:
+                    qty = int(m2.group(1))
             break
 
     return (sku or "UNKNOWN-SKU", qty)
 
 
 def clean_company_suffix(page: fitz.Page) -> None:
-    """Remove destination-line text after FBA:/FBA： without changing nearby layout.
+    """Remove whatever appears after the destination FBA: / FBA： prefix.
 
-    This handles English/Chinese/romanized company names, e.g.
-    "FBA: Chaozhou...", "FBA: dongguan...", "FBA: Changsha...".
-    It keeps the visible FBA/FBA: prefix and only wipes the same-line suffix in
-    the destination column, so the warehouse code line below is not touched.
+    This handles English, Chinese, pinyin, and mixed company/address text, without
+    relying on one fixed company name. It keeps the "FBA:" prefix and only paints
+    the suffix band on that same line. The overlay is limited to the left-side
+    destination block so it will not touch the right-side ship-from block.
     """
+    prefixes = []
+    for token in ("FBA:", "FBA："):
+        try:
+            prefixes.extend(page.search_for(token))
+        except Exception:
+            pass
+
     page_w = page.rect.width
-    # Right column usually starts around the middle of the label. Do not wipe into it.
-    destination_right = min(page_w * 0.50, 153.0 if page_w <= 320 else page_w * 0.50)
-
-    # First try generic line-based cleanup: remove all same-line words after FBA:.
-    for prefix in ("FBA:", "FBA："):
-        rects = page.search_for(prefix)
-        for r in rects:
-            # Ignore the big top title "FBA"; this rect must be in the address area.
-            if r.y0 < 20 or r.x0 > destination_right:
-                continue
-            words = page.get_text("words") or []
-            wipe_rect = None
-            for w in words:
-                x0, y0, x1, y1, word = w[:5]
-                same_line = abs(y0 - r.y0) < 3.0 or (y0 <= r.y1 and y1 >= r.y0)
-                if not same_line:
-                    continue
-                if x0 >= destination_right:
-                    continue
-                # Remove either words after the prefix, or the suffix part of a combined word like FBA:dongguan.
-                if x1 > r.x1 + 0.15 and (x0 >= r.x0 - 0.5):
-                    part = fitz.Rect(max(r.x1 + 0.2, x0), y0 - 0.4, min(x1 + 0.6, destination_right), y1 + 0.4)
-                    wipe_rect = part if wipe_rect is None else (wipe_rect | part)
-            if wipe_rect is None:
-                # Fallback: wipe a short same-line band after FBA: but stay inside destination column.
-                wipe_rect = fitz.Rect(r.x1 + 0.2, r.y0 - 0.3, destination_right, r.y1 + 0.3)
-            shape = page.new_shape()
-            shape.draw_rect(wipe_rect)
-            shape.finish(color=(1, 1, 1), fill=(1, 1, 1), width=0)
-            shape.commit(overlay=True)
-            return
-
-    # Fallback for older exact company names, if the prefix is not searchable.
-    for suffix in REMOVE_SUFFIXES:
-        rects = page.search_for(suffix)
-        if rects:
-            for r in rects:
-                rr = fitz.Rect(r.x0 + 0.05, r.y0 + 0.1, min(r.x1 + 0.3, destination_right), min(r.y1, r.y0 + 9.0))
-                shape = page.new_shape()
-                shape.draw_rect(rr)
-                shape.finish(color=(1, 1, 1), fill=(1, 1, 1), width=0)
-                shape.commit(overlay=True)
-            return
+    page_h = page.rect.height
+    for r in prefixes:
+        # Only clean destination block occurrences: left side, upper half.
+        # Avoid shipment status bars / other incidental occurrences.
+        if r.x0 > page_w * 0.35 or r.y0 > page_h * 0.45:
+            continue
+        # Keep the FBA/FBA: characters intact. Start slightly after the colon.
+        x0 = min(r.x1 + 0.2, page_w * 0.48)
+        # Left destination block usually ends before the page midpoint.
+        x1 = min(page_w * 0.48, r.x1 + page_w * 0.38)
+        if x1 <= x0:
+            continue
+        # Tight vertical band. Do not extend down to warehouse code line.
+        y0 = r.y0 - 0.2
+        y1 = min(r.y1 + 0.35, r.y0 + 10.5)
+        rr = fitz.Rect(x0, y0, x1, y1)
+        shape = page.new_shape()
+        shape.draw_rect(rr)
+        shape.finish(color=(1, 1, 1), fill=(1, 1, 1), width=0)
+        shape.commit(overlay=True)
 
 
 def make_output_page(src_doc: fitz.Document, page_index: int, size_key: str, add_made: bool, made_font_size: float) -> fitz.Document:
@@ -347,14 +327,11 @@ def process_file(
                 qty_sum = 0
                 pages = 0
                 first_sku = ""
-                unique_skus = OrderedDict()
                 try:
                     for i, page in enumerate(src):
                         sku, qty = extract_sku_and_qty(page)
                         if not first_sku and sku != "UNKNOWN-SKU":
                             first_sku = sku
-                        if sku != "UNKNOWN-SKU":
-                            unique_skus[sku] = True
                         qty_sum += qty
                         pages += 1
                         total_pages += 1
@@ -364,8 +341,22 @@ def process_file(
                 finally:
                     src.close()
 
+                # Original-file mode keeps one output per source file, but if the
+                # source contains exactly one recognizable SellerSKU, name it as
+                # SellerSKU-数量只.pdf for consistency.
+                file_skus = []
+                try:
+                    check_doc = fitz.open(str(pdf_path))
+                    for check_page in check_doc:
+                        check_sku, _ = extract_sku_and_qty(check_page)
+                        if check_sku != "UNKNOWN-SKU":
+                            file_skus.append(check_sku)
+                    check_doc.close()
+                except Exception:
+                    file_skus = []
+                unique_skus = sorted(set(file_skus))
                 if len(unique_skus) == 1:
-                    base = f"{safe_name(next(iter(unique_skus)))}-{qty_sum}只"
+                    base = f"{safe_name(unique_skus[0])}-{qty_sum}只"
                 else:
                     base = safe_name(pdf_path.stem) or "processed"
                 count = used_names.get(base, 0) + 1
