@@ -29,7 +29,7 @@
   <div class="card">
     <h2 style="margin:0 0 12px;font-size:20px">功能说明</h2>
     <div class="features">
-      <div class="feature"><strong>1. 清理信息</strong><span>横向去掉 FBA 后面的冒号和公司/地址信息，保留 FBA、目的地和仓库代码完整显示。</span></div>
+      <div class="feature"><strong>1. 清理信息</strong><span>去掉 FBA 后面的公司名字，保留 FBA 和周围版式。</span></div>
       <div class="feature"><strong>2. 尺寸裁剪</strong><span>裁剪尺寸可选择 10×8、10×10、10×15cm。</span></div>
       <div class="feature"><strong>3. Made In China</strong><span>可自行选择是否在每页底部添加 Made In China。</span></div>
       <div class="feature"><strong>4. 合并规则</strong><span>同 SellerSKU 多个货件可选择合并生成同一个 PDF。</span></div>
@@ -58,7 +58,7 @@
     <div class="actions"><button id="inspect" class="secondary">先识别分组</button><button id="process" class="primary">开始处理并下载 ZIP</button></div>
     <div id="status" class="status">等待上传文件...</div>
     <div class="tips">
-      说明：如果勾选“先识别分组”，工具会先识别每页 SellerSKU，并按 SellerSKU 合并输出；如果不勾选，工具会按原文件输出，只做清理、裁剪和可选 Made In China，不会跨文件或跨 SKU 合并。清理 FBA 目的地信息时采用同一行横向擦除，只删除 FBA 后面的冒号及地址/公司名，避免影响上方“目的地”和下方仓库代码。
+      说明：如果勾选“先识别分组”，工具会先识别每页 SellerSKU，并按 SellerSKU 合并输出；如果不勾选，工具会按原文件输出，只做清理、裁剪和可选 Made In China，不会跨文件或跨 SKU 合并。
     </div>
   </div>
 </div>
