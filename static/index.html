@@ -5,38 +5,113 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>PDF 标签处理工具</title>
   <style>
-    :root{--bg:#f6f7fb;--card:#fff;--text:#111827;--muted:#64748b;--line:#e5e7eb;--accent:#2563eb;--ok:#16a34a;--bad:#dc2626;}
-    *{box-sizing:border-box} body{margin:0;background:var(--bg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"Microsoft YaHei",sans-serif;color:var(--text)}
-    .wrap{max-width:960px;margin:36px auto;padding:0 18px}.hero{margin-bottom:18px}.hero h1{margin:0 0 8px;font-size:30px}.hero p{margin:0;color:var(--muted);line-height:1.7}
-    .card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:22px;box-shadow:0 10px 30px rgba(15,23,42,.06)}
+    :root{--bg:#f6f7fb;--card:#fff;--text:#111827;--muted:#64748b;--line:#e5e7eb;--accent:#2563eb;--ok:#16a34a;--warn:#f59e0b;--bad:#dc2626;--soft:#f8fafc;}
+    *{box-sizing:border-box}
+    body{margin:0;background:var(--bg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"Microsoft YaHei",sans-serif;color:var(--text)}
+    .wrap{max-width:1040px;margin:34px auto;padding:0 18px}.hero{margin-bottom:18px}.hero h1{margin:0 0 8px;font-size:30px}.hero p{margin:0;color:var(--muted);line-height:1.7}
+    .card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:22px;box-shadow:0 10px 30px rgba(15,23,42,.06);margin-bottom:16px}
     .grid{display:grid;grid-template-columns:1fr 190px 190px;gap:14px;align-items:end}.row{margin-bottom:14px}label{display:block;font-weight:700;margin-bottom:7px}
-    input[type=file],select,input[type=number]{width:100%;padding:12px;border:1px solid var(--line);border-radius:12px;background:#fff;font-size:15px}.check{display:flex;gap:8px;align-items:center;padding:12px;border:1px solid var(--line);border-radius:12px}
+    input[type=file],select,input[type=number]{width:100%;padding:12px;border:1px solid var(--line);border-radius:12px;background:#fff;font-size:15px}.check{display:flex;gap:9px;align-items:flex-start;padding:13px;border:1px solid var(--line);border-radius:12px;background:#fff;line-height:1.5}.check input{margin-top:3px}.check b{display:block}.check span{display:block;color:var(--muted);font-weight:400;font-size:13px}
     .actions{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:8px}button{border:0;border-radius:12px;padding:13px 16px;font-size:16px;font-weight:800;cursor:pointer}.primary{background:var(--accent);color:white}.secondary{background:#e2e8f0;color:#0f172a}button:disabled{opacity:.55;cursor:not-allowed}
-    .status{margin-top:16px;padding:14px;border-radius:12px;background:#111827;color:#d1d5db;white-space:pre-wrap;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;min-height:100px}.tips{margin-top:14px;color:#64748b;font-size:14px;line-height:1.7}
-    @media(max-width:800px){.grid,.actions{grid-template-columns:1fr}}
+    .status{margin-top:16px;padding:14px;border-radius:12px;background:#111827;color:#d1d5db;white-space:pre-wrap;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;min-height:110px}.tips{margin-top:14px;color:#64748b;font-size:14px;line-height:1.75}
+    .features{display:grid;grid-template-columns:repeat(5,1fr);gap:10px}.feature{background:var(--soft);border:1px solid var(--line);border-radius:14px;padding:13px;line-height:1.55}.feature strong{display:block;margin-bottom:5px}.feature span{font-size:13px;color:var(--muted)}
+    .modebox{display:grid;grid-template-columns:1fr 1fr;gap:12px}.note{padding:12px 14px;border-radius:12px;background:#fff7ed;border:1px solid #fed7aa;color:#9a3412;font-size:14px;line-height:1.65}.hidden{display:none}
+    @media(max-width:900px){.grid,.actions,.features,.modebox{grid-template-columns:1fr}}
   </style>
 </head>
 <body>
 <div class="wrap">
-  <div class="hero"><h1>PDF 标签处理工具</h1><p>上传文件后自动处理并按识别结果分别输出 PDF。</p></div>
+  <div class="hero">
+    <h1>PDF 标签处理工具</h1>
+    <p>上传 PDF 或 ZIP 后处理标签。可按 SellerSKU 分组输出，也可以按原文件输出。</p>
+  </div>
+
+  <div class="card">
+    <h2 style="margin:0 0 12px;font-size:20px">功能说明</h2>
+    <div class="features">
+      <div class="feature"><strong>1. 清理信息</strong><span>去掉 FBA 后面的公司名字，保留 FBA 和周围版式。</span></div>
+      <div class="feature"><strong>2. 尺寸裁剪</strong><span>裁剪尺寸可选择 10×8、10×10、10×15cm。</span></div>
+      <div class="feature"><strong>3. Made In China</strong><span>可自行选择是否在每页底部添加 Made In China。</span></div>
+      <div class="feature"><strong>4. 合并规则</strong><span>同 SellerSKU 多个货件可选择合并生成同一个 PDF。</span></div>
+      <div class="feature"><strong>5. 文件命名</strong><span>按 SellerSKU 合并时，文件名格式为 SellerSKU-数量只.pdf。</span></div>
+    </div>
+  </div>
+
   <div class="card">
     <div class="grid">
       <div class="row"><label>选择文件</label><input id="file" type="file" accept=".pdf,.zip,application/pdf,application/zip"></div>
       <div class="row"><label>输出尺寸</label><select id="size"><option value="10x8">10cm × 8cm</option><option value="10x10">10cm × 10cm</option><option value="10x15">10cm × 15cm</option></select></div>
-      <div class="row"><label>字号</label><input id="fontSize" type="number" value="8" min="5" max="16" step="0.5"></div>
+      <div class="row"><label>Made In China 字号</label><input id="fontSize" type="number" value="8" min="5" max="16" step="0.5"></div>
     </div>
-    <div class="row"><label class="check"><input id="made" type="checkbox"> 每页底部添加 Made In China</label></div>
+
+    <div class="modebox">
+      <label class="check"><input id="groupBySku" type="checkbox" checked>
+        <div><b>先识别分组，并按 SellerSKU 合并输出</b><span>勾选：同一个 SellerSKU 的页面合并为一个 PDF；不同 SellerSKU 分别输出不同 PDF。命名格式：SellerSKU-数量只.pdf。</span></div>
+      </label>
+      <label class="check"><input id="made" type="checkbox">
+        <div><b>每页底部添加 Made In China</b><span>勾选后，文字会添加在页面底部居中位置，距离底部约 0.5cm。</span></div>
+      </label>
+    </div>
+
+    <div id="modeNote" class="note" style="margin-top:12px">当前模式：已勾选“先识别分组”，处理时会按 SellerSKU 分开输出；只有 SellerSKU 完全一致才会合并。</div>
+
     <div class="actions"><button id="inspect" class="secondary">先识别分组</button><button id="process" class="primary">开始处理并下载 ZIP</button></div>
     <div id="status" class="status">等待上传文件...</div>
-    <div class="tips">建议先点“先识别分组”。如果识别到多个分组，处理结果会输出多个 PDF；每个文件名格式为：SKU-数量只.pdf。</div>
+    <div class="tips">
+      说明：如果勾选“先识别分组”，工具会先识别每页 SellerSKU，并按 SellerSKU 合并输出；如果不勾选，工具会按原文件输出，只做清理、裁剪和可选 Made In China，不会跨文件或跨 SKU 合并。
+    </div>
   </div>
 </div>
 <script>
-const fileEl=document.getElementById('file');const statusEl=document.getElementById('status');const inspectBtn=document.getElementById('inspect');const processBtn=document.getElementById('process');
+const fileEl=document.getElementById('file');
+const statusEl=document.getElementById('status');
+const inspectBtn=document.getElementById('inspect');
+const processBtn=document.getElementById('process');
+const groupEl=document.getElementById('groupBySku');
+const noteEl=document.getElementById('modeNote');
 function log(t){statusEl.textContent=t}function append(t){statusEl.textContent += '\n'+t}
-function formBase(){const f=fileEl.files[0];if(!f){alert('请先选择文件');return null}const fd=new FormData();fd.append('file',f);return fd}
-inspectBtn.onclick=async()=>{const fd=formBase();if(!fd)return;inspectBtn.disabled=true;processBtn.disabled=true;log('正在读取分组，请稍等...');try{const res=await fetch('/api/inspect',{method:'POST',body:fd});const data=await res.json();if(!res.ok||data.error)throw new Error(data.error||'识别失败');log(`识别完成：共 ${data.total_pages} 页，分组 ${data.groups.length} 个`);data.groups.forEach(g=>append(`${g.sku}：${g.qty}只`));if(data.groups.length===1&&data.groups[0].sku==='UNKNOWN-SKU')append('提示：未识别到 SKU，请确认上传的是原始可识别 PDF。');}catch(e){log('识别失败：'+e.message)}finally{inspectBtn.disabled=false;processBtn.disabled=false}}
-processBtn.onclick=async()=>{const fd=formBase();if(!fd)return;fd.append('size',document.getElementById('size').value);fd.append('add_made',document.getElementById('made').checked?'true':'false');fd.append('made_font_size',document.getElementById('fontSize').value||'8');inspectBtn.disabled=true;processBtn.disabled=true;log('正在处理并生成 ZIP，请稍等...');try{const res=await fetch('/api/process',{method:'POST',body:fd});if(!res.ok){let msg=await res.text();throw new Error(msg)}const blob=await res.blob();const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='PDF标签处理结果.zip';document.body.appendChild(a);a.click();setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove()},1000);log('处理完成，已开始下载。请解压 ZIP 查看每个 SKU 对应的 PDF。')}catch(e){log('处理失败：'+e.message)}finally{inspectBtn.disabled=false;processBtn.disabled=false}}
+function formBase(){const f=fileEl.files[0];if(!f){alert('请先选择 PDF 或 ZIP 文件');return null}const fd=new FormData();fd.append('file',f);return fd}
+function updateMode(){
+  if(groupEl.checked){
+    noteEl.textContent='当前模式：已勾选“先识别分组”，处理时会按 SellerSKU 分开输出；只有 SellerSKU 完全一致才会合并。';
+    inspectBtn.disabled=false;
+  }else{
+    noteEl.textContent='当前模式：未勾选“先识别分组”，处理时会按原文件输出，不会按 SellerSKU 合并。';
+  }
+}
+groupEl.addEventListener('change', updateMode); updateMode();
+inspectBtn.onclick=async()=>{
+  const fd=formBase();if(!fd)return;
+  inspectBtn.disabled=true;processBtn.disabled=true;log('正在读取 SellerSKU 分组，请稍等...');
+  try{
+    const res=await fetch('/api/inspect',{method:'POST',body:fd});
+    const data=await res.json();
+    if(!res.ok||data.error)throw new Error(data.error||'识别失败');
+    log(`识别完成：共 ${data.total_pages} 页，SellerSKU 分组 ${data.groups.length} 个`);
+    data.groups.forEach(g=>append(`${g.sku}：${g.qty}只`));
+    if(data.groups.length===1&&data.groups[0].sku==='UNKNOWN-SKU')append('提示：未识别到 SellerSKU，请确认上传的是原始可识别 PDF。');
+  }catch(e){log('识别失败：'+e.message)}finally{inspectBtn.disabled=false;processBtn.disabled=false}
+}
+processBtn.onclick=async()=>{
+  const fd=formBase();if(!fd)return;
+  fd.append('size',document.getElementById('size').value);
+  fd.append('add_made',document.getElementById('made').checked?'true':'false');
+  fd.append('made_font_size',document.getElementById('fontSize').value||'8');
+  fd.append('group_by_sku',document.getElementById('groupBySku').checked?'true':'false');
+  inspectBtn.disabled=true;processBtn.disabled=true;
+  log(groupEl.checked ? '正在按 SellerSKU 分组处理并生成 ZIP，请稍等...' : '正在按原文件处理并生成 ZIP，请稍等...');
+  try{
+    const res=await fetch('/api/process',{method:'POST',body:fd});
+    if(!res.ok){let msg=await res.text();throw new Error(msg)}
+    const blob=await res.blob();
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(blob);
+    a.download='PDF标签处理结果.zip';
+    document.body.appendChild(a);a.click();
+    setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove()},1000);
+    log('处理完成，已开始下载。请解压 ZIP 查看输出 PDF。');
+  }catch(e){log('处理失败：'+e.message)}finally{inspectBtn.disabled=false;processBtn.disabled=false;updateMode()}
+}
 </script>
 </body>
 </html>

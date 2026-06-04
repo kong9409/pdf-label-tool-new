@@ -180,7 +180,26 @@ def collect_pdfs(input_path: Path, work_dir: Path) -> List[Path]:
     raise ValueError("Only PDF or ZIP is supported")
 
 
-def process_file(input_path: Path, output_zip: Path, size_key: str, add_made: bool, made_font_size: float) -> Dict:
+def process_file(
+    input_path: Path,
+    output_zip: Path,
+    size_key: str,
+    add_made: bool,
+    made_font_size: float,
+    group_by_sku: bool,
+) -> Dict:
+    """Process PDFs.
+
+    group_by_sku=True:
+      - every page is identified by SellerSKU
+      - pages with the exact same SellerSKU are merged into one PDF
+      - filename: SellerSKU-数量只.pdf
+
+    group_by_sku=False:
+      - keep the original PDF file structure
+      - each source PDF becomes one processed output PDF
+      - no cross-file or cross-SKU merging is performed
+    """
     if size_key not in SIZE_MAP:
         raise ValueError("Invalid size")
 
@@ -190,51 +209,103 @@ def process_file(input_path: Path, output_zip: Path, size_key: str, add_made: bo
         if not pdf_paths:
             raise ValueError("No PDF found")
 
-        groups: "OrderedDict[str, fitz.Document]" = OrderedDict()
-        qty_map: Dict[str, int] = OrderedDict()
-        page_map: Dict[str, int] = OrderedDict()
-        unknown_pages: List[str] = []
-        total_pages = 0
-
-        for pdf_path in pdf_paths:
-            src = fitz.open(str(pdf_path))
-            try:
-                for i, page in enumerate(src):
-                    sku, qty = extract_sku_and_qty(page)
-                    if sku == "UNKNOWN-SKU":
-                        unknown_pages.append(f"{pdf_path.name} page {i + 1}")
-                    total_pages += 1
-                    if sku not in groups:
-                        groups[sku] = fitz.open()
-                        qty_map[sku] = 0
-                        page_map[sku] = 0
-                    one_page_doc = make_output_page(src, i, size_key, add_made, made_font_size)
-                    groups[sku].insert_pdf(one_page_doc)
-                    one_page_doc.close()
-                    qty_map[sku] += qty
-                    page_map[sku] += 1
-            finally:
-                src.close()
-
         out_dir = work_dir / "output"
         out_dir.mkdir()
-        manifest_lines = [
-            "PDF label processing finished",
-            f"Input PDFs: {len(pdf_paths)}",
-            f"Total pages: {total_pages}",
-            f"SKU groups: {len(groups)}",
-            f"Size: {size_key}",
-            f"Made In China: {'yes' if add_made else 'no'}",
-            "",
-            "Groups:",
-        ]
+        total_pages = 0
+        unknown_pages: List[str] = []
 
-        for sku, doc in groups.items():
-            file_name = f"{safe_name(sku)}-{qty_map[sku]}只.pdf"
-            out_pdf = out_dir / file_name
-            doc.save(str(out_pdf), deflate=True, garbage=4)
-            doc.close()
-            manifest_lines.append(f"{file_name}\tpages={page_map[sku]}\tqty={qty_map[sku]}")
+        if group_by_sku:
+            groups: "OrderedDict[str, fitz.Document]" = OrderedDict()
+            qty_map: Dict[str, int] = OrderedDict()
+            page_map: Dict[str, int] = OrderedDict()
+
+            for pdf_path in pdf_paths:
+                src = fitz.open(str(pdf_path))
+                try:
+                    for i, page in enumerate(src):
+                        sku, qty = extract_sku_and_qty(page)
+                        if sku == "UNKNOWN-SKU":
+                            unknown_pages.append(f"{pdf_path.name} page {i + 1}")
+                        total_pages += 1
+                        if sku not in groups:
+                            groups[sku] = fitz.open()
+                            qty_map[sku] = 0
+                            page_map[sku] = 0
+                        one_page_doc = make_output_page(src, i, size_key, add_made, made_font_size)
+                        groups[sku].insert_pdf(one_page_doc)
+                        one_page_doc.close()
+                        qty_map[sku] += qty
+                        page_map[sku] += 1
+                finally:
+                    src.close()
+
+            manifest_lines = [
+                "PDF label processing finished",
+                "Output mode: group by SellerSKU",
+                f"Input PDFs: {len(pdf_paths)}",
+                f"Total pages: {total_pages}",
+                f"SellerSKU groups: {len(groups)}",
+                f"Size: {size_key}",
+                f"Made In China: {'yes' if add_made else 'no'}",
+                "",
+                "Groups:",
+            ]
+
+            for sku, doc in groups.items():
+                file_name = f"{safe_name(sku)}-{qty_map[sku]}只.pdf"
+                out_pdf = out_dir / file_name
+                doc.save(str(out_pdf), deflate=True, garbage=4)
+                doc.close()
+                manifest_lines.append(f"{file_name}\tpages={page_map[sku]}\tqty={qty_map[sku]}")
+
+            skus_payload = [{"sku": sku, "qty": qty_map[sku], "pages": page_map[sku]} for sku in groups]
+
+        else:
+            # Preserve the input-file split. This is useful when the user only wants
+            # cleanup/crop/Made In China without merging different shipments.
+            manifest_lines = [
+                "PDF label processing finished",
+                "Output mode: original files",
+                f"Input PDFs: {len(pdf_paths)}",
+                f"Size: {size_key}",
+                f"Made In China: {'yes' if add_made else 'no'}",
+                "",
+                "Files:",
+            ]
+            skus_payload = []
+            used_names: Dict[str, int] = {}
+
+            for pdf_path in pdf_paths:
+                src = fitz.open(str(pdf_path))
+                out_doc = fitz.open()
+                qty_sum = 0
+                pages = 0
+                first_sku = ""
+                try:
+                    for i, page in enumerate(src):
+                        sku, qty = extract_sku_and_qty(page)
+                        if not first_sku and sku != "UNKNOWN-SKU":
+                            first_sku = sku
+                        qty_sum += qty
+                        pages += 1
+                        total_pages += 1
+                        one_page_doc = make_output_page(src, i, size_key, add_made, made_font_size)
+                        out_doc.insert_pdf(one_page_doc)
+                        one_page_doc.close()
+                finally:
+                    src.close()
+
+                base = safe_name(pdf_path.stem) or "processed"
+                count = used_names.get(base, 0) + 1
+                used_names[base] = count
+                if count > 1:
+                    base = f"{base}-{count}"
+                out_name = f"{base}-处理后.pdf"
+                out_doc.save(str(out_dir / out_name), deflate=True, garbage=4)
+                out_doc.close()
+                manifest_lines.append(f"{out_name}\tpages={pages}\tqty={qty_sum}\tfirst_seller_sku={first_sku or 'UNKNOWN-SKU'}")
+
+            skus_payload = []
 
         if unknown_pages:
             manifest_lines += ["", "Unknown SKU pages:", *unknown_pages]
@@ -250,8 +321,9 @@ def process_file(input_path: Path, output_zip: Path, size_key: str, add_made: bo
         return {
             "input_pdfs": len(pdf_paths),
             "total_pages": total_pages,
-            "groups": len(groups),
-            "skus": [{"sku": sku, "qty": qty_map[sku], "pages": page_map[sku]} for sku in groups],
+            "mode": "group_by_sku" if group_by_sku else "original_files",
+            "groups": len(skus_payload),
+            "skus": skus_payload,
             "unknown_pages": unknown_pages,
         }
 
@@ -289,6 +361,7 @@ async def process(
     size: str = Form("10x8"),
     add_made: bool = Form(False),
     made_font_size: float = Form(8.0),
+    group_by_sku: bool = Form(True),
 ):
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -296,7 +369,7 @@ async def process(
         in_path.write_bytes(await file.read())
         out_zip = tmp / "PDF标签处理结果.zip"
         try:
-            info = process_file(in_path, out_zip, size, add_made, made_font_size)
+            info = process_file(in_path, out_zip, size, add_made, made_font_size, group_by_sku)
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
         final_path = Path(tempfile.gettempdir()) / f"pdf-label-result-{os.getpid()}-{abs(hash(str(out_zip)))}.zip"
