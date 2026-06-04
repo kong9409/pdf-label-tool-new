@@ -121,6 +121,19 @@ def replace_fba_line_text_in_streams(doc: fitz.Document) -> int:
                     suffix = token[end + 1:]  # includes optional spaces and Tj
                     return b'(' + pdf_literal_escape_ascii('FBA') + b')' + suffix
 
+                # If the destination label is stored as a simple literal string,
+                # remove only its trailing colon. CJK-encoded PDFs often cannot be
+                # edited this way, so a tiny visual colon-removal fallback is also
+                # applied later.
+                if plain_str in {'目的地：', '目的地:'}:
+                    changed = True
+                    total += 1
+                    suffix = token[end + 1:]
+                    # CJK literal replacement is handled visually later to avoid broken encodings.
+                    changed = False
+                    total -= 1
+                    return token
+
                 # UTF-16BE-like fallback: \x00F\x00B\x00A\x00:...
                 if plain.startswith(b'\x00F\x00B\x00A\x00:') or plain.startswith(b'\x00F\x00B\x00A\xff\x1a'):
                     changed = True
@@ -136,7 +149,7 @@ def replace_fba_line_text_in_streams(doc: fitz.Document) -> int:
     return total
 
 
-app = FastAPI(title="PDF Label Tool")
+app = FastAPI(title="PDF Label Tool v16")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
@@ -303,6 +316,94 @@ def find_fba_letters_rect(page: fitz.Page, prefix_rect: fitz.Rect) -> fitz.Rect:
     return fitz.Rect(prefix_rect.x0, prefix_rect.y0, prefix_rect.x0 + prefix_rect.width * 0.88, prefix_rect.y1)
 
 
+def find_destination_colon_rects(page: fitz.Page) -> List[fitz.Rect]:
+    """Find only the colon after the destination label, not the label letters.
+
+    The goal is to remove the punctuation after 目的地 while keeping the three
+    Chinese characters visually intact. We prefer searching for the colon glyph
+    itself; if the PDF cannot expose it separately, use a very narrow fallback at
+    the right edge of the destination label.
+    """
+    page_w = page.rect.width
+    page_h = page.rect.height
+    dest_rect = None
+    for token in ("目的地：", "目的地:", "目的地"):
+        try:
+            rects = page.search_for(token)
+        except Exception:
+            rects = []
+        for r in rects:
+            if r.x0 < page_w * 0.35 and r.y0 < page_h * 0.45:
+                dest_rect = r
+                break
+        if dest_rect is not None:
+            break
+    if dest_rect is None:
+        return []
+
+    colon_rects: List[fitz.Rect] = []
+    for colon in ("：", ":"):
+        try:
+            rects = page.search_for(colon)
+        except Exception:
+            rects = []
+        for c in rects:
+            same_row = abs(c.y0 - dest_rect.y0) < max(3.0, dest_rect.height * 0.45)
+            near_dest = dest_rect.x0 <= c.x0 <= dest_rect.x1 + 5.0
+            if same_row and near_dest:
+                colon_rects.append(fitz.Rect(max(0, c.x0 - 0.25), max(0, c.y0 - 0.20), min(page_w, c.x1 + 0.35), min(page_h, c.y1 + 0.20)))
+
+    if colon_rects:
+        return colon_rects[:1]
+
+    # Fallback: remove only the rightmost sliver of the destination label.
+    # This is intentionally narrow to avoid touching the 地 glyph.
+    w = dest_rect.width
+    x0 = dest_rect.x1 - min(max(w * 0.16, 2.2), 5.5)
+    return [fitz.Rect(max(0, x0), max(0, dest_rect.y0 - 0.20), min(page_w, dest_rect.x1 + 0.35), min(page_h, dest_rect.y1 + 0.20))]
+
+
+def remove_destination_colon_visual(page: fitz.Page) -> int:
+    """Remove only the colon after 目的地 using a tiny same-line overlay."""
+    count = 0
+    for rr in find_destination_colon_rects(page):
+        shape = page.new_shape()
+        shape.draw_rect(rr)
+        shape.finish(color=(1, 1, 1), fill=(1, 1, 1), width=0)
+        shape.commit(overlay=True)
+        count += 1
+    return count
+
+
+def remove_destination_colon_on_output(out_page: fitz.Page, original_page: fitz.Page, scale: float, clip: fitz.Rect) -> int:
+    """Remove destination colon after the page has been placed/scaled.
+
+    This runs after any optional repair overlays, so the colon cannot be pasted
+    back accidentally. It maps the original page's colon rect to the output page.
+    """
+    count = 0
+    for rr in find_destination_colon_rects(original_page):
+        if rr.y1 <= clip.y1:
+            dst = fitz.Rect(rr.x0 * scale, rr.y0 * scale, rr.x1 * scale, rr.y1 * scale)
+            shape = out_page.new_shape()
+            shape.draw_rect(dst)
+            shape.finish(color=(1, 1, 1), fill=(1, 1, 1), width=0)
+            shape.commit(overlay=True)
+            count += 1
+    return count
+
+
+def source_has_bottom_warning(page: fitz.Page) -> bool:
+    """Whether the source page has the '请不要遮住此标签' warning.
+
+    When present, place Made In China lower so the two lines do not overlap.
+    """
+    try:
+        return "请不要遮住此标签" in (page.get_text("text") or "")
+    except Exception:
+        return False
+
+
 def clean_company_suffix(page: fitz.Page) -> None:
     """Horizontally remove the destination content after FBA.
 
@@ -363,6 +464,9 @@ def make_output_page(src_doc: fitz.Document, page_index: int, size_key: str, add
     if not replaced_count:
         clean_company_suffix(page)
 
+    # Remove the colon after 目的地 without touching the Chinese characters.
+    remove_destination_colon_visual(page)
+
     src_w, src_h = page.rect.width, page.rect.height
     scale = target_w / src_w
     clip_h = min(src_h, target_h / scale)
@@ -379,12 +483,19 @@ def make_output_page(src_doc: fitz.Document, page_index: int, size_key: str, add
             dst = fitz.Rect(rc.x0 * scale, rc.y0 * scale, rc.x1 * scale, rc.y1 * scale)
             out_page.show_pdf_page(dst, src_doc, page_index, clip=rc, keep_proportion=False, overlay=True)
 
+    # Ensure the destination colon remains removed even if a repair clip was pasted.
+    remove_destination_colon_on_output(out_page, original_page, scale, clip)
+
     if add_made:
         # PyMuPDF's insert_textbox may silently skip text when the box is tight
         # after show_pdf_page. Use baseline insertion with explicit centering instead.
         made_text = "Made In China"
         made_font_size = float(made_font_size or 8.0)
-        made_y = target_h - cm_to_pt(0.5)  # baseline: 0.5 cm from bottom
+        # Default baseline is 0.5 cm from the bottom. If the source label has
+        # the warning '请不要遮住此标签' near the bottom, move Made In China lower
+        # so the two text lines do not overlap.
+        made_offset_cm = 0.25 if source_has_bottom_warning(original_page) else 0.5
+        made_y = min(target_h - 2.5, target_h - cm_to_pt(made_offset_cm))
         text_w = fitz.get_text_length(made_text, fontname="helv", fontsize=made_font_size)
         made_x = max(0, (target_w - text_w) / 2)
         out_page.insert_text(
