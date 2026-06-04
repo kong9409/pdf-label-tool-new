@@ -27,8 +27,10 @@ SIZE_MAP = {
 }
 SKU_PATTERNS = [
     re.compile(r"\bFD-[A-Z0-9][A-Z0-9\-]*\b"),
-    re.compile(r"\b[A-Z]{1,6}-US-[A-Z0-9][A-Z0-9\-]*\b"),
+    re.compile(r"\b[A-Z]{1,8}-US-[A-Z0-9][A-Z0-9\-]*\b"),
+    re.compile(r"\b[A-Z0-9]{2,}[A-Z0-9\-]*-US\b"),
 ]
+SKU_LINE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-]{2,80}$")
 INVALID_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|]+')
 
 app = FastAPI(title="PDF Label Tool")
@@ -43,6 +45,32 @@ def safe_name(name: str) -> str:
 
 def cm_to_pt(v: float) -> float:
     return v * CM_TO_PT
+
+
+def normalize_token(text: str) -> str:
+    return re.sub(r"\s+", "", (text or "").strip())
+
+
+def is_sku_candidate(text: str) -> bool:
+    t = normalize_token(text)
+    if not t:
+        return False
+    bad_keywords = ["数量", "SingleSKU", "MadeInChina", "Created:", "FBA", "请不要遮住", "目的地", "发货地"]
+    if any(k.lower() in t.lower() for k in bad_keywords):
+        return False
+    if re.search(r"[\u4e00-\u9fff]", t):
+        return False
+    if not SKU_LINE_RE.match(t):
+        return False
+    # SellerSKU usually contains at least one hyphen or both letters and digits.
+    has_letter = bool(re.search(r"[A-Za-z]", t))
+    has_digit = bool(re.search(r"\d", t))
+    if "-" not in t and not (has_letter and has_digit):
+        return False
+    # Exclude Amazon FBA shipment/carton ids.
+    if re.match(r"^FBA[A-Z0-9]+$", t, re.I):
+        return False
+    return True
 
 
 def extract_lines(page: fitz.Page) -> List[str]:
@@ -68,31 +96,35 @@ def extract_sku_and_qty(page: fitz.Page) -> Tuple[str, int]:
     sku = ""
     qty = 1
 
-    # Strong rule: SKU is usually the first SKU-looking line after "Single SKU".
+    # Strong rule: SellerSKU is the first valid code line after "Single SKU".
+    # This supports both formats such as FD-US-SD4-AH-BN4875 and FDM888A-FX-US.
     for i, line in enumerate(lines):
         if "Single SKU" in line:
-            for candidate in lines[i + 1 : i + 8]:
-                if "数量" in candidate or candidate.lower().startswith("made in"):
+            for candidate in lines[i + 1 : i + 10]:
+                cand = normalize_token(candidate)
+                if "数量" in candidate or cand.lower().startswith("madeinchina"):
                     break
-                m = None
-                for pat in SKU_PATTERNS:
-                    m = pat.search(candidate.replace(" ", ""))
-                    if m:
-                        break
-                if m:
-                    sku = m.group(0)
+                if is_sku_candidate(cand):
+                    sku = cand
                     break
             if sku:
                 break
 
-    # Fallback: find SKU-looking token near the lower label area or anywhere.
+    # Regex fallback from the complete text, in case line reconstruction changes.
     if not sku:
-        full = "\n".join(lines).replace(" ", "")
+        full_text = "\n".join(lines)
+        m = re.search(r"Single\s*SKU\s*\n\s*([^\n\r]+)\s*\n\s*数量", full_text, re.I)
+        if m and is_sku_candidate(m.group(1)):
+            sku = normalize_token(m.group(1))
+
+    # Older fallback: SKU-looking tokens anywhere, but avoid choosing FBA shipment IDs.
+    if not sku:
+        full = normalize_token("\n".join(lines))
         candidates = []
         for pat in SKU_PATTERNS:
             candidates.extend(pat.findall(full))
+        candidates = [c for c in candidates if is_sku_candidate(c)]
         if candidates:
-            # Prefer longest, most specific candidate.
             sku = sorted(set(candidates), key=lambda x: (-len(x), x))[0]
 
     for i, line in enumerate(lines):
@@ -108,18 +140,52 @@ def extract_sku_and_qty(page: fitz.Page) -> Tuple[str, int]:
 
 
 def clean_company_suffix(page: fitz.Page) -> None:
-    """Visually remove suffix after FBA without repainting surrounding text.
+    """Remove destination-line text after FBA:/FBA： without changing nearby layout.
 
-    The PDF label lines are tightly spaced; using redaction can bite the warehouse line.
-    This draws a conservative white overlay over the suffix band only.
+    This handles English/Chinese/romanized company names, e.g.
+    "FBA: Chaozhou...", "FBA: dongguan...", "FBA: Changsha...".
+    It keeps the visible FBA/FBA: prefix and only wipes the same-line suffix in
+    the destination column, so the warehouse code line below is not touched.
     """
+    page_w = page.rect.width
+    # Right column usually starts around the middle of the label. Do not wipe into it.
+    destination_right = min(page_w * 0.50, 153.0 if page_w <= 320 else page_w * 0.50)
+
+    # First try generic line-based cleanup: remove all same-line words after FBA:.
+    for prefix in ("FBA:", "FBA："):
+        rects = page.search_for(prefix)
+        for r in rects:
+            # Ignore the big top title "FBA"; this rect must be in the address area.
+            if r.y0 < 20 or r.x0 > destination_right:
+                continue
+            words = page.get_text("words") or []
+            wipe_rect = None
+            for w in words:
+                x0, y0, x1, y1, word = w[:5]
+                same_line = abs(y0 - r.y0) < 3.0 or (y0 <= r.y1 and y1 >= r.y0)
+                if not same_line:
+                    continue
+                if x0 >= destination_right:
+                    continue
+                # Remove either words after the prefix, or the suffix part of a combined word like FBA:dongguan.
+                if x1 > r.x1 + 0.15 and (x0 >= r.x0 - 0.5):
+                    part = fitz.Rect(max(r.x1 + 0.2, x0), y0 - 0.4, min(x1 + 0.6, destination_right), y1 + 0.4)
+                    wipe_rect = part if wipe_rect is None else (wipe_rect | part)
+            if wipe_rect is None:
+                # Fallback: wipe a short same-line band after FBA: but stay inside destination column.
+                wipe_rect = fitz.Rect(r.x1 + 0.2, r.y0 - 0.3, destination_right, r.y1 + 0.3)
+            shape = page.new_shape()
+            shape.draw_rect(wipe_rect)
+            shape.finish(color=(1, 1, 1), fill=(1, 1, 1), width=0)
+            shape.commit(overlay=True)
+            return
+
+    # Fallback for older exact company names, if the prefix is not searchable.
     for suffix in REMOVE_SUFFIXES:
         rects = page.search_for(suffix)
         if rects:
             for r in rects:
-                # Keep FBA intact. Avoid extending downward into the warehouse line.
-                y1 = min(r.y1, r.y0 + 9.0)
-                rr = fitz.Rect(r.x0 + 0.05, r.y0 + 0.1, r.x1 + 0.3, y1)
+                rr = fitz.Rect(r.x0 + 0.05, r.y0 + 0.1, min(r.x1 + 0.3, destination_right), min(r.y1, r.y0 + 9.0))
                 shape = page.new_shape()
                 shape.draw_rect(rr)
                 shape.finish(color=(1, 1, 1), fill=(1, 1, 1), width=0)
@@ -281,11 +347,14 @@ def process_file(
                 qty_sum = 0
                 pages = 0
                 first_sku = ""
+                unique_skus = OrderedDict()
                 try:
                     for i, page in enumerate(src):
                         sku, qty = extract_sku_and_qty(page)
                         if not first_sku and sku != "UNKNOWN-SKU":
                             first_sku = sku
+                        if sku != "UNKNOWN-SKU":
+                            unique_skus[sku] = True
                         qty_sum += qty
                         pages += 1
                         total_pages += 1
@@ -295,12 +364,15 @@ def process_file(
                 finally:
                     src.close()
 
-                base = safe_name(pdf_path.stem) or "processed"
+                if len(unique_skus) == 1:
+                    base = f"{safe_name(next(iter(unique_skus)))}-{qty_sum}只"
+                else:
+                    base = safe_name(pdf_path.stem) or "processed"
                 count = used_names.get(base, 0) + 1
                 used_names[base] = count
                 if count > 1:
                     base = f"{base}-{count}"
-                out_name = f"{base}-处理后.pdf"
+                out_name = f"{base}.pdf"
                 out_doc.save(str(out_dir / out_name), deflate=True, garbage=4)
                 out_doc.close()
                 manifest_lines.append(f"{out_name}\tpages={pages}\tqty={qty_sum}\tfirst_seller_sku={first_sku or 'UNKNOWN-SKU'}")
