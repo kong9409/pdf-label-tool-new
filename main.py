@@ -149,7 +149,7 @@ def replace_fba_line_text_in_streams(doc: fitz.Document) -> int:
     return total
 
 
-app = FastAPI(title="PDF Label Tool v16")
+app = FastAPI(title="PDF Label Tool v17")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
@@ -464,8 +464,7 @@ def make_output_page(src_doc: fitz.Document, page_index: int, size_key: str, add
     if not replaced_count:
         clean_company_suffix(page)
 
-    # Remove the colon after 目的地 without touching the Chinese characters.
-    remove_destination_colon_visual(page)
+    # Keep the colon after 目的地. Do not erase or patch this label.
 
     src_w, src_h = page.rect.width, page.rect.height
     scale = target_w / src_w
@@ -483,8 +482,7 @@ def make_output_page(src_doc: fitz.Document, page_index: int, size_key: str, add
             dst = fitz.Rect(rc.x0 * scale, rc.y0 * scale, rc.x1 * scale, rc.y1 * scale)
             out_page.show_pdf_page(dst, src_doc, page_index, clip=rc, keep_proportion=False, overlay=True)
 
-    # Ensure the destination colon remains removed even if a repair clip was pasted.
-    remove_destination_colon_on_output(out_page, original_page, scale, clip)
+    # Keep the destination colon as-is.
 
     if add_made:
         # PyMuPDF's insert_textbox may silently skip text when the box is tight
