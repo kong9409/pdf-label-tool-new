@@ -1,43 +1,53 @@
-# PDF 标签处理工具 - Zeabur 部署版 v11
+# PDF 标签处理工具 v19
 
-## 功能说明
+这是 Zeabur 部署版：网页前端 + Python / PyMuPDF 后端。
 
-1. 去掉 FBA 后面的公司名字，保留 FBA 和周围版式。
-2. 裁剪尺寸可选择：10cm × 8cm、10cm × 10cm、10cm × 15cm。
-3. 可自行选择是否添加 Made In China；添加位置为页面底部居中，距离底部约 0.5cm。
-4. 可选择“先识别分组，并按 SellerSKU 合并输出”：同 SellerSKU 多个货件会合并生成同一个 PDF，不同 SellerSKU 会分开输出不同 PDF。
-5. 按 SellerSKU 合并时，文件命名格式为：`SellerSKU-数量只.pdf`。
+## 功能
 
-## 输出模式
+1. 去掉目的地行里 `FBA` 后面的公司名/地址信息，保留 `FBA`、`目的地：`、仓库代码和地址行排版。
+2. 裁剪尺寸可选择 `10×8cm`、`10×10cm`、`10×15cm`。
+3. 可选在每页底部居中添加 `Made In China`；如果页面底部有“请不要遮住此标签”，会自动避开，避免重叠。
+4. 可选择“先识别分组，并按 SellerSKU 合并输出”。
+5. 文件命名依据可选择：
+   - `SellerSKU`：输出 `SellerSKU-数量只.pdf`
+   - `仓库 SKU`：上传映射表后输出 `仓库SKU-数量只.pdf`
+6. 输出 ZIP 中，每个 PDF 会放在同名文件夹里，例如：
 
-### 勾选“先识别分组，并按 SellerSKU 合并输出”
-
-- 每一页读取 `Single SKU` 下方的 SellerSKU。
-- 只有 SellerSKU 完全一致才合并。
-- 不同 SellerSKU 分别输出不同 PDF。
-- 文件名格式：`SellerSKU-数量只.pdf`。
-
-### 不勾选“先识别分组，并按 SellerSKU 合并输出”
-
-- 按原 PDF 文件输出。
-- 不会跨文件、跨 SellerSKU 合并。
-- 只做清理 FBA 后缀、裁剪尺寸、可选添加 Made In China。
-
-## Zeabur 部署
-
-1. 把本文件夹全部上传到 GitHub 仓库根目录。
-2. 打开 Zeabur 项目：https://zeabur.com/projects
-3. 进入对应 Project，点击 Add Service / New Service。
-4. 选择 GitHub。
-5. 选择刚才上传的仓库。
-6. Zeabur 会读取 Dockerfile 并部署。
-7. 部署完成后打开 Zeabur 提供的域名，即可使用。
-
-## 本地测试（可选）
-
-```bash
-pip install -r requirements.txt
-uvicorn main:app --host 0.0.0.0 --port 8080
+```text
+SELLER-SKU-001-60只/
+└── SELLER-SKU-001-60只.pdf
 ```
 
-然后打开 http://127.0.0.1:8080
+或选择仓库 SKU 映射后：
+
+```text
+WAREHOUSE-SKU-001-60只/
+└── WAREHOUSE-SKU-001-60只.pdf
+```
+
+## SKU 映射表格式
+
+支持 `.xlsx` 和 `.csv`。
+
+推荐表头：
+
+| sellersku | 映射仓库sku |
+|---|---|
+| SELLER-SKU-001 | WAREHOUSE-SKU-001 |
+
+工具会用第一列匹配 PDF 识别出来的 SellerSKU，用第二列作为文件夹和文件名里的仓库 SKU。
+
+## 更新到 Zeabur
+
+将本目录里的文件放到 GitHub 仓库根目录：
+
+```text
+main.py
+Dockerfile
+requirements.txt
+zbpack.json
+static/index.html
+README.md
+```
+
+提交后回 Zeabur 重新部署即可。

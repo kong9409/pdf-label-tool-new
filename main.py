@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import io
 import os
 import re
@@ -8,7 +9,7 @@ import tempfile
 import zipfile
 from collections import OrderedDict
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import fitz  # PyMuPDF
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
@@ -23,8 +24,7 @@ SIZE_MAP = {
     "10x10": (10.0, 10.0),
     "10x15": (10.0, 15.0),
 }
-# Broad SellerSKU pattern. Real labels include variants such as:
-# FD-US-SD4-AH-BN4875, FD-US-8D-3-4871-S, FDM888A-FX-US.
+# Broad SellerSKU pattern. Real labels may include letters, numbers, and hyphens.
 SKU_TOKEN_PATTERN = re.compile(r"(?<![A-Z0-9])[A-Z0-9][A-Z0-9-]{3,}(?![A-Z0-9])")
 FBA_SHIPMENT_PATTERN = re.compile(r"^FBA[0-9A-Z]{8,}U\d+$")
 INVALID_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|]+')
@@ -149,7 +149,7 @@ def replace_fba_line_text_in_streams(doc: fitz.Document) -> int:
     return total
 
 
-app = FastAPI(title="PDF Label Tool v17")
+app = FastAPI(title="PDF Label Tool v19")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
@@ -184,8 +184,7 @@ def extract_lines(page: fitz.Page) -> List[str]:
 def normalize_sku_candidate(text: str) -> str:
     """Return a clean SellerSKU candidate or an empty string.
 
-    We deliberately do NOT require '-US-' because some SellerSKU values end with
-    '-US' (for example FDM888A-FX-US). We only reject known non-SKU label tokens.
+    We deliberately do NOT require a fixed prefix or marketplace segment because SellerSKU formats vary. We only reject known non-SKU label tokens.
     """
     t = re.sub(r"\s+", "", text.strip().upper())
     t = t.strip("：:;,.，。")
@@ -202,9 +201,12 @@ def normalize_sku_candidate(text: str) -> str:
     if not m:
         return ""
     candidate = m.group(0)
-    # Avoid picking simple warehouse codes or product short names like LAS1 / 888A.
-    if "-" not in candidate and not candidate.startswith(("FD", "FDM", "SKU")):
-        return ""
+    # Avoid picking short warehouse codes or simple product shorthand values.
+    if "-" not in candidate:
+        # For SKU values without hyphens, require a longer mixed letter/number token
+        # to avoid capturing short warehouse codes or simple product shorthand.
+        if len(candidate) < 8 or not re.search(r"[A-Z]", candidate) or not re.search(r"\d", candidate):
+            return ""
     if len(candidate) < 5:
         return ""
     return candidate
@@ -409,7 +411,7 @@ def clean_company_suffix(page: fitz.Page) -> None:
 
     Important: remove the colon too. The result should visually be only "FBA"
     on that line. The erase band is a very narrow same-line rectangle so it will
-    not touch the line above (目的地) or the warehouse code below (LAS1 / XLX7 / etc.).
+    not touch the line above (目的地) or the warehouse code below.
     """
     prefixes = []
     for token in ("FBA:", "FBA："):
@@ -521,6 +523,99 @@ def collect_pdfs(input_path: Path, work_dir: Path) -> List[Path]:
     raise ValueError("Only PDF or ZIP is supported")
 
 
+
+
+def load_sku_mapping(mapping_path: Optional[Path]) -> Dict[str, str]:
+    """Load SellerSKU -> warehouse SKU mapping from xlsx/csv.
+
+    Supported header names:
+      - SellerSKU column: sellersku / seller sku / seller_sku / msku / sku
+      - Warehouse SKU column: 映射仓库sku / 仓库sku / warehouse sku / warehouse_sku / wh sku
+
+    If no header can be found, first column is treated as SellerSKU and second
+    column as warehouse SKU. Blank rows are ignored. Keys are normalized by
+    removing spaces and uppercasing, but values keep their original text.
+    """
+    if not mapping_path:
+        return {}
+    if not mapping_path.exists() or mapping_path.stat().st_size == 0:
+        return {}
+
+    def norm_key(v: object) -> str:
+        return re.sub(r"\s+", "", str(v or "").strip().upper())
+
+    def norm_header(v: object) -> str:
+        return re.sub(r"[\s_\-]+", "", str(v or "").strip().lower())
+
+    rows: List[List[object]] = []
+    suffix = mapping_path.suffix.lower()
+    if suffix in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
+        from openpyxl import load_workbook
+        wb = load_workbook(str(mapping_path), read_only=True, data_only=True)
+        ws = wb.active
+        for row in ws.iter_rows(values_only=True):
+            values = list(row or [])
+            if any(str(c or "").strip() for c in values):
+                rows.append(values)
+        wb.close()
+    elif suffix == ".csv":
+        raw = mapping_path.read_bytes()
+        text = raw.decode("utf-8-sig", errors="ignore")
+        for row in csv.reader(io.StringIO(text)):
+            if any(str(c or "").strip() for c in row):
+                rows.append(row)
+    else:
+        # Unknown mapping format: ignore rather than fail the whole job.
+        return {}
+
+    if not rows:
+        return {}
+
+    header = [norm_header(c) for c in rows[0]]
+    seller_names = {"sellersku", "sellerskuid", "sellsku", "sellerskucode", "sellerskuno", "msku", "sku", "卖家sku", "销售sku"}
+    warehouse_names = {"映射仓库sku", "仓库sku", "仓库skuid", "warehousesku", "warehouse", "whsku", "仓库编码", "内部sku", "本地sku"}
+
+    seller_idx = next((i for i, h in enumerate(header) if h in seller_names or "seller" in h and "sku" in h), None)
+    warehouse_idx = next((i for i, h in enumerate(header) if h in warehouse_names or ("warehouse" in h and "sku" in h) or ("仓库" in h and "sku" in h)), None)
+
+    data_rows = rows[1:]
+    if seller_idx is None or warehouse_idx is None:
+        seller_idx, warehouse_idx = 0, 1
+        data_rows = rows if not (len(rows[0]) >= 2 and ("sku" in header[0] or "仓库" in header[1])) else rows[1:]
+
+    mapping: Dict[str, str] = {}
+    for row in data_rows:
+        if len(row) <= max(seller_idx, warehouse_idx):
+            continue
+        seller = norm_key(row[seller_idx])
+        warehouse = str(row[warehouse_idx] or "").strip()
+        if seller and warehouse:
+            mapping[seller] = warehouse
+    return mapping
+
+
+def mapped_sku_for_naming(seller_sku: str, naming_mode: str, sku_mapping: Dict[str, str]) -> str:
+    if naming_mode == "warehouse":
+        key = re.sub(r"\s+", "", str(seller_sku or "").strip().upper())
+        return sku_mapping.get(key) or seller_sku or "UNKNOWN-SKU"
+    return seller_sku or "UNKNOWN-SKU"
+
+
+def write_group_pdf(doc: fitz.Document, out_dir: Path, base: str, used_bases: Dict[str, int]) -> Path:
+    """Save one PDF into a same-name folder: base/base.pdf.
+
+    If names collide after mapping/sanitizing, append -2, -3 to the folder and file base.
+    """
+    safe_base = safe_name(base)
+    count = used_bases.get(safe_base, 0) + 1
+    used_bases[safe_base] = count
+    final_base = safe_base if count == 1 else f"{safe_base}-{count}"
+    folder = out_dir / final_base
+    folder.mkdir(parents=True, exist_ok=True)
+    out_pdf = folder / f"{final_base}.pdf"
+    doc.save(str(out_pdf), deflate=True, garbage=4)
+    return out_pdf
+
 def process_file(
     input_path: Path,
     output_zip: Path,
@@ -528,6 +623,8 @@ def process_file(
     add_made: bool,
     made_font_size: float,
     group_by_sku: bool,
+    naming_mode: str = "seller",
+    mapping_path: Optional[Path] = None,
 ) -> Dict:
     """Process PDFs.
 
@@ -543,6 +640,9 @@ def process_file(
     """
     if size_key not in SIZE_MAP:
         raise ValueError("Invalid size")
+    if naming_mode not in {"seller", "warehouse"}:
+        naming_mode = "seller"
+    sku_mapping = load_sku_mapping(mapping_path) if naming_mode == "warehouse" else {}
 
     with tempfile.TemporaryDirectory() as td:
         work_dir = Path(td)
@@ -559,24 +659,30 @@ def process_file(
             groups: "OrderedDict[str, fitz.Document]" = OrderedDict()
             qty_map: Dict[str, int] = OrderedDict()
             page_map: Dict[str, int] = OrderedDict()
+            seller_map: Dict[str, List[str]] = OrderedDict()
 
             for pdf_path in pdf_paths:
                 src = fitz.open(str(pdf_path))
                 try:
                     for i, page in enumerate(src):
-                        sku, qty = extract_sku_and_qty(page)
-                        if sku == "UNKNOWN-SKU":
+                        seller_sku, qty = extract_sku_and_qty(page)
+                        if seller_sku == "UNKNOWN-SKU":
                             unknown_pages.append(f"{pdf_path.name} page {i + 1}")
+                        display_sku = mapped_sku_for_naming(seller_sku, naming_mode, sku_mapping)
+                        group_key = display_sku if naming_mode == "warehouse" else seller_sku
                         total_pages += 1
-                        if sku not in groups:
-                            groups[sku] = fitz.open()
-                            qty_map[sku] = 0
-                            page_map[sku] = 0
+                        if group_key not in groups:
+                            groups[group_key] = fitz.open()
+                            qty_map[group_key] = 0
+                            page_map[group_key] = 0
+                            seller_map[group_key] = []
+                        if seller_sku not in seller_map[group_key]:
+                            seller_map[group_key].append(seller_sku)
                         one_page_doc = make_output_page(src, i, size_key, add_made, made_font_size)
-                        groups[sku].insert_pdf(one_page_doc)
+                        groups[group_key].insert_pdf(one_page_doc)
                         one_page_doc.close()
-                        qty_map[sku] += qty
-                        page_map[sku] += 1
+                        qty_map[group_key] += qty
+                        page_map[group_key] += 1
                 finally:
                     src.close()
 
@@ -586,20 +692,25 @@ def process_file(
                 f"Input PDFs: {len(pdf_paths)}",
                 f"Total pages: {total_pages}",
                 f"SellerSKU groups: {len(groups)}",
+                f"Naming mode: {'warehouse SKU' if naming_mode == 'warehouse' else 'SellerSKU'}",
+                f"Mapping rows: {len(sku_mapping)}",
                 f"Size: {size_key}",
                 f"Made In China: {'yes' if add_made else 'no'}",
                 "",
                 "Groups:",
             ]
 
-            for sku, doc in groups.items():
-                file_name = f"{safe_name(sku)}-{qty_map[sku]}只.pdf"
-                out_pdf = out_dir / file_name
-                doc.save(str(out_pdf), deflate=True, garbage=4)
+            used_bases: Dict[str, int] = {}
+            skus_payload = []
+            for group_key, doc in groups.items():
+                display_sku = group_key
+                base = f"{safe_name(display_sku)}-{qty_map[group_key]}只"
+                out_pdf = write_group_pdf(doc, out_dir, base, used_bases)
                 doc.close()
-                manifest_lines.append(f"{file_name}\tpages={page_map[sku]}\tqty={qty_map[sku]}")
-
-            skus_payload = [{"sku": sku, "qty": qty_map[sku], "pages": page_map[sku]} for sku in groups]
+                rel = out_pdf.relative_to(out_dir)
+                sellers = ",".join(seller_map.get(group_key, []))
+                manifest_lines.append(f"{rel}\tseller_sku={sellers}\tname_sku={display_sku}\tpages={page_map[group_key]}\tqty={qty_map[group_key]}")
+                skus_payload.append({"sku": sellers, "name_sku": display_sku, "qty": qty_map[group_key], "pages": page_map[group_key]})
 
         else:
             # Preserve the input-file split. This is useful when the user only wants
@@ -608,6 +719,8 @@ def process_file(
                 "PDF label processing finished",
                 "Output mode: original files",
                 f"Input PDFs: {len(pdf_paths)}",
+                f"Naming mode: {'warehouse SKU' if naming_mode == 'warehouse' else 'SellerSKU'}",
+                f"Mapping rows: {len(sku_mapping)}",
                 f"Size: {size_key}",
                 f"Made In China: {'yes' if add_made else 'no'}",
                 "",
@@ -651,17 +764,13 @@ def process_file(
                     file_skus = []
                 unique_skus = sorted(set(file_skus))
                 if len(unique_skus) == 1:
-                    base = f"{safe_name(unique_skus[0])}-{qty_sum}只"
+                    name_sku = mapped_sku_for_naming(unique_skus[0], naming_mode, sku_mapping)
+                    base = f"{safe_name(name_sku)}-{qty_sum}只"
                 else:
                     base = safe_name(pdf_path.stem) or "processed"
-                count = used_names.get(base, 0) + 1
-                used_names[base] = count
-                if count > 1:
-                    base = f"{base}-{count}"
-                out_name = f"{base}.pdf"
-                out_doc.save(str(out_dir / out_name), deflate=True, garbage=4)
+                out_pdf = write_group_pdf(out_doc, out_dir, base, used_names)
                 out_doc.close()
-                manifest_lines.append(f"{out_name}\tpages={pages}\tqty={qty_sum}\tfirst_seller_sku={first_sku or 'UNKNOWN-SKU'}")
+                manifest_lines.append(f"{out_pdf.relative_to(out_dir)}\tpages={pages}\tqty={qty_sum}\tfirst_seller_sku={first_sku or 'UNKNOWN-SKU'}")
 
             skus_payload = []
 
@@ -692,23 +801,44 @@ def index() -> str:
 
 
 @app.post("/api/inspect")
-async def inspect(file: UploadFile = File(...)):
+async def inspect(
+    file: UploadFile = File(...),
+    naming_mode: str = Form("seller"),
+    mapping_file: Optional[UploadFile] = File(None),
+):
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         in_path = tmp / safe_name(file.filename or "input.pdf")
         in_path.write_bytes(await file.read())
+        mapping_path = None
+        if mapping_file and mapping_file.filename:
+            mapping_path = tmp / safe_name(mapping_file.filename)
+            mapping_path.write_bytes(await mapping_file.read())
         try:
+            sku_mapping = load_sku_mapping(mapping_path) if naming_mode == "warehouse" else {}
             pdfs = collect_pdfs(in_path, tmp)
             group_counts: Dict[str, int] = OrderedDict()
+            group_pages: Dict[str, int] = OrderedDict()
+            seller_map: Dict[str, List[str]] = OrderedDict()
             total_pages = 0
             for pdf_path in pdfs:
                 doc = fitz.open(str(pdf_path))
                 for page in doc:
-                    sku, qty = extract_sku_and_qty(page)
-                    group_counts[sku] = group_counts.get(sku, 0) + qty
+                    seller_sku, qty = extract_sku_and_qty(page)
+                    display_sku = mapped_sku_for_naming(seller_sku, naming_mode, sku_mapping)
+                    group_key = display_sku if naming_mode == "warehouse" else seller_sku
+                    group_counts[group_key] = group_counts.get(group_key, 0) + qty
+                    group_pages[group_key] = group_pages.get(group_key, 0) + 1
+                    seller_map.setdefault(group_key, [])
+                    if seller_sku not in seller_map[group_key]:
+                        seller_map[group_key].append(seller_sku)
                     total_pages += 1
                 doc.close()
-            return {"total_pages": total_pages, "groups": [{"sku": k, "qty": v} for k, v in group_counts.items()]}
+            groups = []
+            for group_key, qty in group_counts.items():
+                name_sku = group_key
+                groups.append({"sku": ",".join(seller_map.get(group_key, [])), "name_sku": name_sku, "qty": qty, "pages": group_pages.get(group_key, 0), "file_base": f"{safe_name(name_sku)}-{qty}只"})
+            return {"total_pages": total_pages, "groups": groups, "naming_mode": naming_mode, "mapping_rows": len(sku_mapping)}
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=400)
 
@@ -720,14 +850,20 @@ async def process(
     add_made: bool = Form(False),
     made_font_size: float = Form(8.0),
     group_by_sku: bool = Form(True),
+    naming_mode: str = Form("seller"),
+    mapping_file: Optional[UploadFile] = File(None),
 ):
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         in_path = tmp / safe_name(file.filename or "input.pdf")
         in_path.write_bytes(await file.read())
+        mapping_path = None
+        if mapping_file and mapping_file.filename:
+            mapping_path = tmp / safe_name(mapping_file.filename)
+            mapping_path.write_bytes(await mapping_file.read())
         out_zip = tmp / "PDF标签处理结果.zip"
         try:
-            info = process_file(in_path, out_zip, size, add_made, made_font_size, group_by_sku)
+            info = process_file(in_path, out_zip, size, add_made, made_font_size, group_by_sku, naming_mode, mapping_path)
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
         final_path = Path(tempfile.gettempdir()) / f"pdf-label-result-{os.getpid()}-{abs(hash(str(out_zip)))}.zip"
