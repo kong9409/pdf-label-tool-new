@@ -9,33 +9,43 @@ import tempfile
 import zipfile
 from collections import OrderedDict
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
 
 import fitz  # PyMuPDF
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 CM_TO_PT = 72 / 2.54
-# Do not hard-code one company name. The tool removes whatever appears
-# after the destination "FBA:" / "FBA：" prefix on that same line.
 SIZE_MAP = {
     "10x8": (10.0, 8.0),
     "10x10": (10.0, 10.0),
     "10x15": (10.0, 15.0),
 }
+
 # Broad SellerSKU pattern. Real labels may include letters, numbers, and hyphens.
-SKU_TOKEN_PATTERN = re.compile(r"(?<![A-Z0-9])[A-Z0-9][A-Z0-9-]{3,}(?![A-Z0-9])")
-FBA_SHIPMENT_PATTERN = re.compile(r"^FBA[0-9A-Z]{8,}U\d+$")
+SKU_TOKEN_PATTERN = re.compile(r"[A-Z0-9][A-Z0-9_-]{3,}")
+FBA_SHIPMENT_PATTERN = re.compile(r"FBA[A-Z0-9]{8,}")
 INVALID_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|]+')
 
-
-
+# PDF text operators supported by this version.
 PDF_LITERAL_TJ_RE = re.compile(rb"\((?:\\.|[^\\)])*\)\s*Tj")
+PDF_ARRAY_TJ_RE = re.compile(rb"\[(?:\\.|[^\]])*\]\s*TJ", re.S)
+PDF_TEXT_TOKEN_RE = re.compile(rb"\((?:\\.|[^\\)])*\)|<\s*[0-9A-Fa-f\s]+\s*>", re.S)
+
+
+def safe_name(name: str) -> str:
+    name = INVALID_FILENAME_CHARS.sub("-", str(name or "").strip())
+    name = re.sub(r"\s+", " ", name).strip(" .")
+    return name or "UNKNOWN-SKU"
+
+
+def cm_to_pt(v: float) -> float:
+    return v * CM_TO_PT
 
 
 def pdf_literal_unescape(data: bytes) -> bytes:
-    """Small PDF literal string unescaper for matching only."""
+    """Small PDF literal string unescaper, enough for label text matching."""
     out = bytearray()
     i = 0
     while i < len(data):
@@ -43,23 +53,27 @@ def pdf_literal_unescape(data: bytes) -> bytes:
         if b == 0x5C and i + 1 < len(data):  # backslash
             n = data[i + 1]
             mapping = {
-                ord('n'): b'\n', ord('r'): b'\r', ord('t'): b'\t',
-                ord('b'): b'\b', ord('f'): b'\f', ord('('): b'(',
-                ord(')'): b')', ord('\\'): b'\\',
+                ord("n"): b"\n",
+                ord("r"): b"\r",
+                ord("t"): b"\t",
+                ord("b"): b"\b",
+                ord("f"): b"\f",
+                ord("("): b"(",
+                ord(")"): b")",
+                ord("\\"): b"\\",
             }
             if n in mapping:
                 out.extend(mapping[n])
                 i += 2
                 continue
-            # Octal escape: \ddd
-            if 48 <= n <= 55:
+            if 48 <= n <= 55:  # octal escape \ddd
                 j = i + 1
                 oct_digits = []
                 while j < len(data) and len(oct_digits) < 3 and 48 <= data[j] <= 55:
                     oct_digits.append(chr(data[j]))
                     j += 1
                 try:
-                    out.append(int(''.join(oct_digits), 8) & 0xFF)
+                    out.append(int("".join(oct_digits), 8) & 0xFF)
                     i = j
                     continue
                 except Exception:
@@ -74,93 +88,168 @@ def pdf_literal_unescape(data: bytes) -> bytes:
 
 
 def pdf_literal_escape_ascii(text: str) -> bytes:
-    raw = text.encode('ascii')
-    return raw.replace(b'\\', b'\\\\').replace(b'(', b'\\(').replace(b')', b'\\)')
+    raw = text.encode("ascii")
+    return raw.replace(b"\\", b"\\\\").replace(b"(", b"\\(").replace(b")", b"\\)")
+
+
+def pdf_hex_to_bytes(token: bytes) -> bytes:
+    inner = token.strip()[1:-1]
+    inner = re.sub(rb"\s+", b"", inner)
+    if len(inner) % 2 == 1:
+        inner += b"0"
+    try:
+        return bytes.fromhex(inner.decode("ascii"))
+    except Exception:
+        return b""
+
+
+def decode_pdf_text_token(token: bytes) -> str:
+    token = token.strip()
+    if token.startswith(b"("):
+        raw = pdf_literal_unescape(token[1:-1])
+    elif token.startswith(b"<"):
+        raw = pdf_hex_to_bytes(token)
+    else:
+        return ""
+
+    if raw.startswith(b"\xfe\xff"):
+        try:
+            return raw[2:].decode("utf-16-be", errors="ignore")
+        except Exception:
+            return ""
+
+    if b"\x00" in raw:
+        try:
+            return raw.decode("utf-16-be", errors="ignore")
+        except Exception:
+            pass
+
+    try:
+        return raw.decode("latin1", errors="ignore")
+    except Exception:
+        return ""
+
+
+def build_fba_replacement_from_array(array_token: bytes) -> bytes:
+    """
+    Replace a TJ array containing FBA:xxxx with native FBA only.
+    For per-character arrays, preserve the original F/B/A glyph tokens and kerning.
+    For UTF-16BE hex arrays, use a UTF-16BE hex FBA token.
+    """
+    content_start = array_token.find(b"[")
+    content_end = array_token.rfind(b"]")
+    if content_start < 0 or content_end <= content_start:
+        return b"[(FBA)] TJ"
+
+    content = array_token[content_start + 1 : content_end]
+    string_matches = list(PDF_TEXT_TOKEN_RE.finditer(content))
+    decoded = "".join(decode_pdf_text_token(m.group(0)) for m in string_matches)
+
+    if not (decoded.startswith("FBA:") or decoded.startswith("FBA：")):
+        return array_token
+
+    # If F, B, A are separate tokens, keep the original glyph tokens up to A.
+    char_count = 0
+    cut_pos = None
+    for m in string_matches:
+        txt = decode_pdf_text_token(m.group(0))
+        char_count += len(txt)
+        if char_count == 3:
+            cut_pos = m.end()
+            break
+        if char_count > 3:
+            break
+
+    if cut_pos is not None:
+        return b"[" + content[:cut_pos] + b"] TJ"
+
+    first = string_matches[0].group(0) if string_matches else b""
+    if first.strip().startswith(b"<"):
+        # UTF-16BE hex for FBA.
+        return b"[<004600420041>] TJ"
+
+    return b"[(FBA)] TJ"
 
 
 def replace_fba_line_text_in_streams(doc: fitz.Document) -> int:
-    """True text replacement in PDF content streams.
+    """
+    True PDF content-stream replacement.
 
-    Replace literal text objects like '(FBA: Any Company Or Address)Tj' with
-    '(FBA)Tj'. This preserves the original font, size, matrix, and surrounding
-    layout because only the string content is changed. It avoids visual erasing,
-    so it will not cover '目的地' or the warehouse code below.
+    Replaces destination line text only when it starts with:
+      FBA: ...
+      FBA：...
+
+    Supported source encodings:
+      (FBA: company) Tj
+      [(F)-0.000(B)-0.000(A)-0.000(:)...] TJ
+      [<004600420041003a...>] TJ
+
+    This function never draws white boxes, so it will not cover the ship-from
+    name/address, destination title, warehouse code, or warehouse address.
     """
     total = 0
+
     for page in doc:
         for xref in page.get_contents() or []:
             try:
                 stream = doc.xref_stream(xref)
             except Exception:
                 continue
+
             changed = False
 
-            def repl(m: re.Match[bytes]) -> bytes:
+            def repl_literal_tj(m: re.Match[bytes]) -> bytes:
                 nonlocal changed, total
                 token = m.group(0)
-                # Strip surrounding '(...)' and trailing Tj while preserving spacing before Tj.
-                start = token.find(b'(')
-                end = token.rfind(b')')
+                start = token.find(b"(")
+                end = token.rfind(b")")
                 if start < 0 or end <= start:
                     return token
-                inner = token[start + 1:end]
+
+                inner = token[start + 1 : end]
                 plain = pdf_literal_unescape(inner)
+                plain_str = plain.decode("latin1", errors="ignore")
 
-                # ASCII/common encoding cases.
-                plain_str = ''
-                try:
-                    plain_str = plain.decode('latin1', errors='ignore')
-                except Exception:
-                    plain_str = ''
-
-                # Match FBA: / FBA： followed by any content on the same text object.
-                # Do NOT change the big title '(FBA)Tj'.
-                if plain_str.startswith('FBA:') or plain_str.startswith('FBA：'):
+                if plain_str.startswith("FBA:") or plain_str.startswith("FBA："):
                     changed = True
                     total += 1
-                    suffix = token[end + 1:]  # includes optional spaces and Tj
-                    return b'(' + pdf_literal_escape_ascii('FBA') + b')' + suffix
+                    suffix = token[end + 1 :]  # includes optional whitespace and Tj
+                    return b"(" + pdf_literal_escape_ascii("FBA") + b")" + suffix
 
-                # If the destination label is stored as a simple literal string,
-                # remove only its trailing colon. CJK-encoded PDFs often cannot be
-                # edited this way, so a tiny visual colon-removal fallback is also
-                # applied later.
-                if plain_str in {'目的地：', '目的地:'}:
+                if plain.startswith(b"\x00F\x00B\x00A\x00:") or plain.startswith(b"\x00F\x00B\x00A\xff\x1a"):
                     changed = True
                     total += 1
-                    suffix = token[end + 1:]
-                    # CJK literal replacement is handled visually later to avoid broken encodings.
-                    changed = False
-                    total -= 1
-                    return token
-
-                # UTF-16BE-like fallback: \x00F\x00B\x00A\x00:...
-                if plain.startswith(b'\x00F\x00B\x00A\x00:') or plain.startswith(b'\x00F\x00B\x00A\xff\x1a'):
-                    changed = True
-                    total += 1
-                    suffix = token[end + 1:]
-                    return b'(FBA)' + suffix
+                    suffix = token[end + 1 :]
+                    return b"<004600420041>" + suffix
 
                 return token
 
-            new_stream = PDF_LITERAL_TJ_RE.sub(repl, stream)
+            def repl_array_tj(m: re.Match[bytes]) -> bytes:
+                nonlocal changed, total
+                token = m.group(0)
+                content_start = token.find(b"[")
+                content_end = token.rfind(b"]")
+                if content_start < 0 or content_end <= content_start:
+                    return token
+
+                content = token[content_start + 1 : content_end]
+                string_matches = list(PDF_TEXT_TOKEN_RE.finditer(content))
+                decoded = "".join(decode_pdf_text_token(mm.group(0)) for mm in string_matches)
+
+                if decoded.startswith("FBA:") or decoded.startswith("FBA："):
+                    changed = True
+                    total += 1
+                    return build_fba_replacement_from_array(token)
+
+                return token
+
+            new_stream = PDF_LITERAL_TJ_RE.sub(repl_literal_tj, stream)
+            new_stream = PDF_ARRAY_TJ_RE.sub(repl_array_tj, new_stream)
+
             if changed and new_stream != stream:
                 doc.update_stream(xref, new_stream)
+
     return total
-
-
-app = FastAPI(title="PDF Label Tool v19")
-app.mount("/static", StaticFiles(directory="static"), name="static")
-
-
-def safe_name(name: str) -> str:
-    name = INVALID_FILENAME_CHARS.sub("-", name.strip())
-    name = re.sub(r"\s+", " ", name).strip(" .")
-    return name or "UNKNOWN-SKU"
-
-
-def cm_to_pt(v: float) -> float:
-    return v * CM_TO_PT
 
 
 def extract_lines(page: fitz.Page) -> List[str]:
@@ -168,44 +257,42 @@ def extract_lines(page: fitz.Page) -> List[str]:
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     if lines:
         return lines
-    # Fallback: sort spans by visual row.
+
     d = page.get_text("dict")
     rows: List[Tuple[float, float, str]] = []
     for b in d.get("blocks", []):
-        for l in b.get("lines", []):
-            y = min((s.get("bbox", [0, 0, 0, 0])[1] for s in l.get("spans", [])), default=0)
-            x = min((s.get("bbox", [0, 0, 0, 0])[0] for s in l.get("spans", [])), default=0)
-            t = "".join(s.get("text", "") for s in l.get("spans", [])).strip()
+        for line in b.get("lines", []):
+            y = min((s.get("bbox", [0, 0, 0, 0])[1] for s in line.get("spans", [])), default=0)
+            x = min((s.get("bbox", [0, 0, 0, 0])[0] for s in line.get("spans", [])), default=0)
+            t = "".join(s.get("text", "") for s in line.get("spans", [])).strip()
             if t:
                 rows.append((y, x, t))
     return [t for _, _, t in sorted(rows)]
 
 
-def normalize_sku_candidate(text: str) -> str:
-    """Return a clean SellerSKU candidate or an empty string.
-
-    We deliberately do NOT require a fixed prefix or marketplace segment because SellerSKU formats vary. We only reject known non-SKU label tokens.
-    """
+def normalize_sku_candidate(text: str, allow_short: bool = False) -> str:
     t = re.sub(r"\s+", "", text.strip().upper())
     t = t.strip("：:;,.，。")
     if not t:
         return ""
     if t.startswith("FBA") or FBA_SHIPMENT_PATTERN.match(t):
         return ""
+    if any(word in t for word in {"GUANGDONG", "SHENZHEN", "PERRYSBURG", "FREMONT", "中国", "美国", "深圳"}):
+        return ""
     if t in {"SINGLESKU", "SKU", "MADEINCHINA"}:
         return ""
     if "数量" in t or t.startswith("QTY") or t.startswith("COUNT"):
         return ""
-    # Need a SKU-like token: enough length, alnum, usually has a hyphen.
+
     m = SKU_TOKEN_PATTERN.search(t)
     if not m:
         return ""
     candidate = m.group(0)
-    # Avoid picking short warehouse codes or simple product shorthand values.
     if "-" not in candidate:
-        # For SKU values without hyphens, require a longer mixed letter/number token
-        # to avoid capturing short warehouse codes or simple product shorthand.
-        if len(candidate) < 8 or not re.search(r"[A-Z]", candidate) or not re.search(r"\d", candidate):
+        if allow_short:
+            if len(candidate) < 4 or not re.search(r"[A-Z]", candidate) or not re.search(r"\d", candidate):
+                return ""
+        elif len(candidate) < 8 or not re.search(r"[A-Z]", candidate) or not re.search(r"\d", candidate):
             return ""
     if len(candidate) < 5:
         return ""
@@ -217,24 +304,22 @@ def extract_sku_and_qty(page: fitz.Page) -> Tuple[str, int]:
     sku = ""
     qty = 1
 
-    # 1) Strong rule: the SellerSKU is the next meaningful line after "Single SKU".
     for i, line in enumerate(lines):
         if "Single SKU" in line:
             after = line.split("Single SKU", 1)[1].strip()
-            direct = normalize_sku_candidate(after)
+            direct = normalize_sku_candidate(after, allow_short=True)
             if direct:
                 sku = direct
                 break
             for candidate in lines[i + 1 : i + 10]:
                 if "数量" in candidate or candidate.lower().startswith("made in"):
                     break
-                cand = normalize_sku_candidate(candidate)
+                cand = normalize_sku_candidate(candidate, allow_short=True)
                 if cand:
                     sku = cand
                     break
             break
 
-    # 2) Fallback: scan all lines, but reject FBA shipment IDs and warehouse codes.
     if not sku:
         for line in lines:
             cand = normalize_sku_candidate(line)
@@ -242,7 +327,6 @@ def extract_sku_and_qty(page: fitz.Page) -> Tuple[str, int]:
                 sku = cand
                 break
 
-    # Quantity: supports "数量 6", "数量:6", or quantity on the next line.
     for i, line in enumerate(lines):
         if "数量" in line:
             m = re.search(r"数量\s*[:：]?\s*(\d+)", line)
@@ -257,217 +341,30 @@ def extract_sku_and_qty(page: fitz.Page) -> Tuple[str, int]:
     return (sku or "UNKNOWN-SKU", qty)
 
 
-def find_destination_repair_clips(page: fitz.Page) -> List[fitz.Rect]:
-    """Return tight clips for labels that must stay visually intact.
-
-    We later paste these clips from the ORIGINAL page onto the processed page.
-    This makes the repaired text use the original PDF glyphs/font, so it does not
-    look like a newly typed patch.
-    """
-    clips: List[fitz.Rect] = []
-    page_w = page.rect.width
-    page_h = page.rect.height
-
-    for token in ("目的地：", "目的地:", "目的地"):
-        try:
-            rects = page.search_for(token)
-        except Exception:
-            rects = []
-        for r in rects:
-            if r.x0 < page_w * 0.35 and r.y0 < page_h * 0.45:
-                clips.append(fitz.Rect(max(0, r.x0 - 0.8), max(0, r.y0 - 0.8), min(page_w, r.x1 + 1.0), min(page_h, r.y1 + 1.0)))
-                break
-        if clips:
-            break
-
-    # For the destination FBA line, only preserve the FBA letters, not the colon.
-    prefix_rects = []
-    for token in ("FBA:", "FBA："):
-        try:
-            prefix_rects.extend(page.search_for(token))
-        except Exception:
-            pass
-    for r in prefix_rects:
-        if r.x0 < page_w * 0.35 and r.y0 < page_h * 0.45:
-            # Use the exact FBA-letter rect when possible. This avoids pasting the
-            # colon back while keeping all three FBA letters complete.
-            fba_letters = find_fba_letters_rect(page, r)
-            clips.append(fitz.Rect(max(0, fba_letters.x0 - 0.4), max(0, fba_letters.y0 - 0.6), min(page_w, fba_letters.x1 - 0.05), min(page_h, fba_letters.y1 + 0.6)))
-            break
-    return clips
-
-
-def find_fba_letters_rect(page: fitz.Page, prefix_rect: fitz.Rect) -> fitz.Rect:
-    """Find the tight rectangle of the FBA letters inside/near an FBA: prefix."""
-    best = None
-    best_score = 1e9
-    try:
-        rects = page.search_for("FBA")
-    except Exception:
-        rects = []
-    for rr in rects:
-        # Same visual row and close x position.
-        score = abs(rr.y0 - prefix_rect.y0) + abs(rr.x0 - prefix_rect.x0)
-        if score < best_score and abs(rr.y0 - prefix_rect.y0) < max(3.0, prefix_rect.height):
-            best = rr
-            best_score = score
-    if best is not None:
-        return best
-    # Fallback: keep most of the prefix width. Latin colon is usually narrow;
-    # Chinese colon is wider, but this still preserves FBA better than 0.72.
-    return fitz.Rect(prefix_rect.x0, prefix_rect.y0, prefix_rect.x0 + prefix_rect.width * 0.88, prefix_rect.y1)
-
-
-def find_destination_colon_rects(page: fitz.Page) -> List[fitz.Rect]:
-    """Find only the colon after the destination label, not the label letters.
-
-    The goal is to remove the punctuation after 目的地 while keeping the three
-    Chinese characters visually intact. We prefer searching for the colon glyph
-    itself; if the PDF cannot expose it separately, use a very narrow fallback at
-    the right edge of the destination label.
-    """
-    page_w = page.rect.width
-    page_h = page.rect.height
-    dest_rect = None
-    for token in ("目的地：", "目的地:", "目的地"):
-        try:
-            rects = page.search_for(token)
-        except Exception:
-            rects = []
-        for r in rects:
-            if r.x0 < page_w * 0.35 and r.y0 < page_h * 0.45:
-                dest_rect = r
-                break
-        if dest_rect is not None:
-            break
-    if dest_rect is None:
-        return []
-
-    colon_rects: List[fitz.Rect] = []
-    for colon in ("：", ":"):
-        try:
-            rects = page.search_for(colon)
-        except Exception:
-            rects = []
-        for c in rects:
-            same_row = abs(c.y0 - dest_rect.y0) < max(3.0, dest_rect.height * 0.45)
-            near_dest = dest_rect.x0 <= c.x0 <= dest_rect.x1 + 5.0
-            if same_row and near_dest:
-                colon_rects.append(fitz.Rect(max(0, c.x0 - 0.25), max(0, c.y0 - 0.20), min(page_w, c.x1 + 0.35), min(page_h, c.y1 + 0.20)))
-
-    if colon_rects:
-        return colon_rects[:1]
-
-    # Fallback: remove only the rightmost sliver of the destination label.
-    # This is intentionally narrow to avoid touching the 地 glyph.
-    w = dest_rect.width
-    x0 = dest_rect.x1 - min(max(w * 0.16, 2.2), 5.5)
-    return [fitz.Rect(max(0, x0), max(0, dest_rect.y0 - 0.20), min(page_w, dest_rect.x1 + 0.35), min(page_h, dest_rect.y1 + 0.20))]
-
-
-def remove_destination_colon_visual(page: fitz.Page) -> int:
-    """Remove only the colon after 目的地 using a tiny same-line overlay."""
-    count = 0
-    for rr in find_destination_colon_rects(page):
-        shape = page.new_shape()
-        shape.draw_rect(rr)
-        shape.finish(color=(1, 1, 1), fill=(1, 1, 1), width=0)
-        shape.commit(overlay=True)
-        count += 1
-    return count
-
-
-def remove_destination_colon_on_output(out_page: fitz.Page, original_page: fitz.Page, scale: float, clip: fitz.Rect) -> int:
-    """Remove destination colon after the page has been placed/scaled.
-
-    This runs after any optional repair overlays, so the colon cannot be pasted
-    back accidentally. It maps the original page's colon rect to the output page.
-    """
-    count = 0
-    for rr in find_destination_colon_rects(original_page):
-        if rr.y1 <= clip.y1:
-            dst = fitz.Rect(rr.x0 * scale, rr.y0 * scale, rr.x1 * scale, rr.y1 * scale)
-            shape = out_page.new_shape()
-            shape.draw_rect(dst)
-            shape.finish(color=(1, 1, 1), fill=(1, 1, 1), width=0)
-            shape.commit(overlay=True)
-            count += 1
-    return count
-
-
 def source_has_bottom_warning(page: fitz.Page) -> bool:
-    """Whether the source page has the '请不要遮住此标签' warning.
-
-    When present, place Made In China lower so the two lines do not overlap.
-    """
     try:
         return "请不要遮住此标签" in (page.get_text("text") or "")
     except Exception:
         return False
 
 
-def clean_company_suffix(page: fitz.Page) -> None:
-    """Horizontally remove the destination content after FBA.
-
-    Important: remove the colon too. The result should visually be only "FBA"
-    on that line. The erase band is a very narrow same-line rectangle so it will
-    not touch the line above (目的地) or the warehouse code below.
-    """
-    prefixes = []
-    for token in ("FBA:", "FBA："):
-        try:
-            prefixes.extend(page.search_for(token))
-        except Exception:
-            pass
-
-    page_w = page.rect.width
-    page_h = page.rect.height
-    for r in prefixes:
-        # Only clean destination block occurrences: left side, upper half.
-        if r.x0 > page_w * 0.35 or r.y0 > page_h * 0.45:
-            continue
-        # Keep only the FBA letters; erase the colon and everything to the right.
-        fba_letters = find_fba_letters_rect(page, r)
-        x0 = min(fba_letters.x1 - 0.02, page_w * 0.60)
-        # Destination block ends before the middle/right ship-from block.
-        x1 = min(page_w * 0.56, r.x0 + page_w * 0.55)
-        if x1 <= x0:
-            continue
-        # Same-line horizontal erase only. Keep vertical padding tiny.
-        y0 = max(0, r.y0 - 0.35)
-        y1 = min(page_h, r.y1 + 0.35)
-        rr = fitz.Rect(x0, y0, x1, y1)
-        shape = page.new_shape()
-        shape.draw_rect(rr)
-        shape.finish(color=(1, 1, 1), fill=(1, 1, 1), width=0)
-        shape.commit(overlay=True)
-
-
-def make_output_page(src_doc: fitz.Document, page_index: int, size_key: str, add_made: bool, made_font_size: float) -> fitz.Document:
+def make_output_page(
+    src_doc: fitz.Document,
+    page_index: int,
+    size_key: str,
+    add_made: bool,
+    made_font_size: float,
+) -> fitz.Document:
     width_cm, height_cm = SIZE_MAP[size_key]
     target_w = cm_to_pt(width_cm)
     target_h = cm_to_pt(height_cm)
 
-    # Work on a one-page copy so overlays do not affect original text extraction.
     tmp = fitz.open()
     tmp.insert_pdf(src_doc, from_page=page_index, to_page=page_index)
-    # Preferred path: real content-stream replacement. This keeps the font and
-    # layout intact and removes FBA suffix without drawing any white box.
-    replaced_count = replace_fba_line_text_in_streams(tmp)
+    replace_fba_line_text_in_streams(tmp)
+
     page = tmp[0]
-
-    # Capture tiny clips from the ORIGINAL page before any fallback cleanup.
-    # With content replacement this usually is not needed, but it remains a safe
-    # guard for old PDFs where the FBA line is not stored as a simple literal.
     original_page = src_doc[page_index]
-    repair_clips = [] if replaced_count else find_destination_repair_clips(original_page)
-
-    # Fallback only when the PDF cannot be stream-replaced. Keep it last resort.
-    if not replaced_count:
-        clean_company_suffix(page)
-
-    # Keep the colon after 目的地. Do not erase or patch this label.
-
     src_w, src_h = page.rect.width, page.rect.height
     scale = target_w / src_w
     clip_h = min(src_h, target_h / scale)
@@ -475,25 +372,17 @@ def make_output_page(src_doc: fitz.Document, page_index: int, size_key: str, add
 
     out = fitz.open()
     out_page = out.new_page(width=target_w, height=target_h)
-    out_page.show_pdf_page(fitz.Rect(0, 0, target_w, target_h), tmp, 0, clip=clip, keep_proportion=False)
-
-    # Paste back the preserved original labels after cleaning. Because we paste
-    # from the source PDF, font/spacing stays visually identical.
-    for rc in repair_clips:
-        if rc.y1 <= clip.y1:
-            dst = fitz.Rect(rc.x0 * scale, rc.y0 * scale, rc.x1 * scale, rc.y1 * scale)
-            out_page.show_pdf_page(dst, src_doc, page_index, clip=rc, keep_proportion=False, overlay=True)
-
-    # Keep the destination colon as-is.
+    out_page.show_pdf_page(
+        fitz.Rect(0, 0, target_w, target_h),
+        tmp,
+        0,
+        clip=clip,
+        keep_proportion=False,
+    )
 
     if add_made:
-        # PyMuPDF's insert_textbox may silently skip text when the box is tight
-        # after show_pdf_page. Use baseline insertion with explicit centering instead.
         made_text = "Made In China"
         made_font_size = float(made_font_size or 8.0)
-        # Default baseline is 0.5 cm from the bottom. If the source label has
-        # the warning '请不要遮住此标签' near the bottom, move Made In China lower
-        # so the two text lines do not overlap.
         made_offset_cm = 0.25 if source_has_bottom_warning(original_page) else 0.5
         made_y = min(target_h - 2.5, target_h - cm_to_pt(made_offset_cm))
         text_w = fitz.get_text_length(made_text, fontname="helv", fontsize=made_font_size)
@@ -520,25 +409,11 @@ def collect_pdfs(input_path: Path, work_dir: Path) -> List[Path]:
         with zipfile.ZipFile(input_path, "r") as zf:
             zf.extractall(extract_dir)
         return sorted(extract_dir.rglob("*.pdf"))
-    raise ValueError("Only PDF or ZIP is supported")
-
-
+    raise ValueError("只支持 PDF 或 ZIP 文件")
 
 
 def load_sku_mapping(mapping_path: Optional[Path]) -> Dict[str, str]:
-    """Load SellerSKU -> warehouse SKU mapping from xlsx/csv.
-
-    Supported header names:
-      - SellerSKU column: sellersku / seller sku / seller_sku / msku / sku
-      - Warehouse SKU column: 映射仓库sku / 仓库sku / warehouse sku / warehouse_sku / wh sku
-
-    If no header can be found, first column is treated as SellerSKU and second
-    column as warehouse SKU. Blank rows are ignored. Keys are normalized by
-    removing spaces and uppercasing, but values keep their original text.
-    """
-    if not mapping_path:
-        return {}
-    if not mapping_path.exists() or mapping_path.stat().st_size == 0:
+    if not mapping_path or not mapping_path.exists() or mapping_path.stat().st_size == 0:
         return {}
 
     def norm_key(v: object) -> str:
@@ -551,6 +426,7 @@ def load_sku_mapping(mapping_path: Optional[Path]) -> Dict[str, str]:
     suffix = mapping_path.suffix.lower()
     if suffix in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
         from openpyxl import load_workbook
+
         wb = load_workbook(str(mapping_path), read_only=True, data_only=True)
         ws = wb.active
         for row in ws.iter_rows(values_only=True):
@@ -565,7 +441,6 @@ def load_sku_mapping(mapping_path: Optional[Path]) -> Dict[str, str]:
             if any(str(c or "").strip() for c in row):
                 rows.append(row)
     else:
-        # Unknown mapping format: ignore rather than fail the whole job.
         return {}
 
     if not rows:
@@ -574,14 +449,16 @@ def load_sku_mapping(mapping_path: Optional[Path]) -> Dict[str, str]:
     header = [norm_header(c) for c in rows[0]]
     seller_names = {"sellersku", "sellerskuid", "sellsku", "sellerskucode", "sellerskuno", "msku", "sku", "卖家sku", "销售sku"}
     warehouse_names = {"映射仓库sku", "仓库sku", "仓库skuid", "warehousesku", "warehouse", "whsku", "仓库编码", "内部sku", "本地sku"}
-
-    seller_idx = next((i for i, h in enumerate(header) if h in seller_names or "seller" in h and "sku" in h), None)
+    seller_idx = next((i for i, h in enumerate(header) if h in seller_names or ("seller" in h and "sku" in h)), None)
     warehouse_idx = next((i for i, h in enumerate(header) if h in warehouse_names or ("warehouse" in h and "sku" in h) or ("仓库" in h and "sku" in h)), None)
 
-    data_rows = rows[1:]
     if seller_idx is None or warehouse_idx is None:
         seller_idx, warehouse_idx = 0, 1
-        data_rows = rows if not (len(rows[0]) >= 2 and ("sku" in header[0] or "仓库" in header[1])) else rows[1:]
+        data_rows = rows
+        if len(rows[0]) >= 2 and ("sku" in header[0] or "仓库" in header[1]):
+            data_rows = rows[1:]
+    else:
+        data_rows = rows[1:]
 
     mapping: Dict[str, str] = {}
     for row in data_rows:
@@ -602,10 +479,6 @@ def mapped_sku_for_naming(seller_sku: str, naming_mode: str, sku_mapping: Dict[s
 
 
 def write_group_pdf(doc: fitz.Document, out_dir: Path, base: str, used_bases: Dict[str, int]) -> Path:
-    """Save one PDF into a same-name folder: base/base.pdf.
-
-    If names collide after mapping/sanitizing, append -2, -3 to the folder and file base.
-    """
     safe_base = safe_name(base)
     count = used_bases.get(safe_base, 0) + 1
     used_bases[safe_base] = count
@@ -615,6 +488,7 @@ def write_group_pdf(doc: fitz.Document, out_dir: Path, base: str, used_bases: Di
     out_pdf = folder / f"{final_base}.pdf"
     doc.save(str(out_pdf), deflate=True, garbage=4)
     return out_pdf
+
 
 def process_file(
     input_path: Path,
@@ -626,34 +500,24 @@ def process_file(
     naming_mode: str = "seller",
     mapping_path: Optional[Path] = None,
 ) -> Dict:
-    """Process PDFs.
-
-    group_by_sku=True:
-      - every page is identified by SellerSKU
-      - pages with the exact same SellerSKU are merged into one PDF
-      - filename: SellerSKU-数量只.pdf
-
-    group_by_sku=False:
-      - keep the original PDF file structure
-      - each source PDF becomes one processed output PDF
-      - no cross-file or cross-SKU merging is performed
-    """
     if size_key not in SIZE_MAP:
-        raise ValueError("Invalid size")
+        raise ValueError("尺寸参数无效")
     if naming_mode not in {"seller", "warehouse"}:
         naming_mode = "seller"
+
     sku_mapping = load_sku_mapping(mapping_path) if naming_mode == "warehouse" else {}
 
     with tempfile.TemporaryDirectory() as td:
         work_dir = Path(td)
         pdf_paths = collect_pdfs(input_path, work_dir)
         if not pdf_paths:
-            raise ValueError("No PDF found")
+            raise ValueError("没有找到 PDF 文件")
 
         out_dir = work_dir / "output"
         out_dir.mkdir()
         total_pages = 0
         unknown_pages: List[str] = []
+        used_bases: Dict[str, int] = {}
 
         if group_by_sku:
             groups: "OrderedDict[str, fitz.Document]" = OrderedDict()
@@ -699,8 +563,6 @@ def process_file(
                 "",
                 "Groups:",
             ]
-
-            used_bases: Dict[str, int] = {}
             skus_payload = []
             for group_key, doc in groups.items():
                 display_sku = group_key
@@ -711,10 +573,7 @@ def process_file(
                 sellers = ",".join(seller_map.get(group_key, []))
                 manifest_lines.append(f"{rel}\tseller_sku={sellers}\tname_sku={display_sku}\tpages={page_map[group_key]}\tqty={qty_map[group_key]}")
                 skus_payload.append({"sku": sellers, "name_sku": display_sku, "qty": qty_map[group_key], "pages": page_map[group_key]})
-
         else:
-            # Preserve the input-file split. This is useful when the user only wants
-            # cleanup/crop/Made In China without merging different shipments.
             manifest_lines = [
                 "PDF label processing finished",
                 "Output mode: original files",
@@ -728,18 +587,20 @@ def process_file(
             ]
             skus_payload = []
             used_names: Dict[str, int] = {}
-
             for pdf_path in pdf_paths:
                 src = fitz.open(str(pdf_path))
                 out_doc = fitz.open()
                 qty_sum = 0
                 pages = 0
+                file_skus: List[str] = []
                 first_sku = ""
                 try:
                     for i, page in enumerate(src):
                         sku, qty = extract_sku_and_qty(page)
-                        if not first_sku and sku != "UNKNOWN-SKU":
-                            first_sku = sku
+                        if sku != "UNKNOWN-SKU":
+                            file_skus.append(sku)
+                            if not first_sku:
+                                first_sku = sku
                         qty_sum += qty
                         pages += 1
                         total_pages += 1
@@ -749,19 +610,6 @@ def process_file(
                 finally:
                     src.close()
 
-                # Original-file mode keeps one output per source file, but if the
-                # source contains exactly one recognizable SellerSKU, name it as
-                # SellerSKU-数量只.pdf for consistency.
-                file_skus = []
-                try:
-                    check_doc = fitz.open(str(pdf_path))
-                    for check_page in check_doc:
-                        check_sku, _ = extract_sku_and_qty(check_page)
-                        if check_sku != "UNKNOWN-SKU":
-                            file_skus.append(check_sku)
-                    check_doc.close()
-                except Exception:
-                    file_skus = []
                 unique_skus = sorted(set(file_skus))
                 if len(unique_skus) == 1:
                     name_sku = mapped_sku_for_naming(unique_skus[0], naming_mode, sku_mapping)
@@ -772,11 +620,8 @@ def process_file(
                 out_doc.close()
                 manifest_lines.append(f"{out_pdf.relative_to(out_dir)}\tpages={pages}\tqty={qty_sum}\tfirst_seller_sku={first_sku or 'UNKNOWN-SKU'}")
 
-            skus_payload = []
-
         if unknown_pages:
             manifest_lines += ["", "Unknown SKU pages:", *unknown_pages]
-
         (out_dir / "处理说明.txt").write_text("\n".join(manifest_lines), encoding="utf-8")
 
         if output_zip.exists():
@@ -793,6 +638,10 @@ def process_file(
             "skus": skus_payload,
             "unknown_pages": unknown_pages,
         }
+
+
+app = FastAPI(title="PDF Label Tool v20")
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -823,21 +672,28 @@ async def inspect(
             total_pages = 0
             for pdf_path in pdfs:
                 doc = fitz.open(str(pdf_path))
-                for page in doc:
-                    seller_sku, qty = extract_sku_and_qty(page)
-                    display_sku = mapped_sku_for_naming(seller_sku, naming_mode, sku_mapping)
-                    group_key = display_sku if naming_mode == "warehouse" else seller_sku
-                    group_counts[group_key] = group_counts.get(group_key, 0) + qty
-                    group_pages[group_key] = group_pages.get(group_key, 0) + 1
-                    seller_map.setdefault(group_key, [])
-                    if seller_sku not in seller_map[group_key]:
-                        seller_map[group_key].append(seller_sku)
-                    total_pages += 1
-                doc.close()
+                try:
+                    for page in doc:
+                        seller_sku, qty = extract_sku_and_qty(page)
+                        display_sku = mapped_sku_for_naming(seller_sku, naming_mode, sku_mapping)
+                        group_key = display_sku if naming_mode == "warehouse" else seller_sku
+                        group_counts[group_key] = group_counts.get(group_key, 0) + qty
+                        group_pages[group_key] = group_pages.get(group_key, 0) + 1
+                        seller_map.setdefault(group_key, [])
+                        if seller_sku not in seller_map[group_key]:
+                            seller_map[group_key].append(seller_sku)
+                        total_pages += 1
+                finally:
+                    doc.close()
             groups = []
             for group_key, qty in group_counts.items():
-                name_sku = group_key
-                groups.append({"sku": ",".join(seller_map.get(group_key, [])), "name_sku": name_sku, "qty": qty, "pages": group_pages.get(group_key, 0), "file_base": f"{safe_name(name_sku)}-{qty}只"})
+                groups.append({
+                    "sku": ",".join(seller_map.get(group_key, [])),
+                    "name_sku": group_key,
+                    "qty": qty,
+                    "pages": group_pages.get(group_key, 0),
+                    "file_base": f"{safe_name(group_key)}-{qty}只",
+                })
             return {"total_pages": total_pages, "groups": groups, "naming_mode": naming_mode, "mapping_rows": len(sku_mapping)}
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=400)
@@ -863,7 +719,7 @@ async def process(
             mapping_path.write_bytes(await mapping_file.read())
         out_zip = tmp / "PDF标签处理结果.zip"
         try:
-            info = process_file(in_path, out_zip, size, add_made, made_font_size, group_by_sku, naming_mode, mapping_path)
+            process_file(in_path, out_zip, size, add_made, made_font_size, group_by_sku, naming_mode, mapping_path)
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
         final_path = Path(tempfile.gettempdir()) / f"pdf-label-result-{os.getpid()}-{abs(hash(str(out_zip)))}.zip"

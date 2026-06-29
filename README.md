@@ -1,53 +1,49 @@
-# PDF 标签处理工具 v19
+# PDF 标签处理工具 v20
 
-这是 Zeabur 部署版：网页前端 + Python / PyMuPDF 后端。
+## 本版修复点
 
-## 功能
+v20 主要修复目的地 FBA 公司名清理逻辑：
 
-1. 去掉目的地行里 `FBA` 后面的公司名/地址信息，保留 `FBA`、`目的地：`、仓库代码和地址行排版。
-2. 裁剪尺寸可选择 `10×8cm`、`10×10cm`、`10×15cm`。
-3. 可选在每页底部居中添加 `Made In China`；如果页面底部有“请不要遮住此标签”，会自动避开，避免重叠。
-4. 可选择“先识别分组，并按 SellerSKU 合并输出”。
-5. 文件命名依据可选择：
-   - `SellerSKU`：输出 `SellerSKU-数量只.pdf`
-   - `仓库 SKU`：上传映射表后输出 `仓库SKU-数量只.pdf`
-6. 输出 ZIP 中，每个 PDF 会放在同名文件夹里，例如：
+- 优先使用 PDF content stream 文本流替换：`FBA: 任意公司名` / `FBA：任意公司名` -> `FBA`
+- 支持 `(FBA: xxx) Tj`
+- 支持 `[(F)-0.000(B)-0.000(A)-0.000(:)...] TJ`
+- 支持 `[<004600420041003a...>] TJ` 这类 UTF-16BE hex 文本
+- 不再使用横向白框擦除 fallback，避免挡住右侧发货地姓名、仓库代码和地址
+- 保留 `目的地：`、`FBA`、仓库代码、仓库地址、发货地姓名和地址
 
-```text
-SELLER-SKU-001-60只/
-└── SELLER-SKU-001-60只.pdf
+## 本地运行
+
+```bash
+pip install -r requirements.txt
+uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-或选择仓库 SKU 映射后：
+打开：
 
 ```text
-WAREHOUSE-SKU-001-60只/
-└── WAREHOUSE-SKU-001-60只.pdf
+http://127.0.0.1:8000
 ```
 
-## SKU 映射表格式
+## Zeabur 部署
 
-支持 `.xlsx` 和 `.csv`。
+上传本仓库到 GitHub 后，在 Zeabur 选择该 GitHub 仓库部署即可。
 
-推荐表头：
+启动命令可填：
 
-| sellersku | 映射仓库sku |
-|---|---|
-| SELLER-SKU-001 | WAREHOUSE-SKU-001 |
-
-工具会用第一列匹配 PDF 识别出来的 SellerSKU，用第二列作为文件夹和文件名里的仓库 SKU。
-
-## 更新到 Zeabur
-
-将本目录里的文件放到 GitHub 仓库根目录：
-
-```text
-main.py
-Dockerfile
-requirements.txt
-zbpack.json
-static/index.html
-README.md
+```bash
+uvicorn main:app --host 0.0.0.0 --port $PORT
 ```
 
-提交后回 Zeabur 重新部署即可。
+如果 Zeabur 识别为 Node 项目，也可以使用 `package.json` 里的：
+
+```bash
+npm start
+```
+
+## 输出
+
+- 支持 PDF / ZIP 输入
+- 支持 10x8、10x10、10x15 cm
+- 可选添加 Made In China
+- 可选按 SellerSKU 合并
+- 可选上传 SellerSKU -> 仓库 SKU 映射表，并按仓库 SKU 命名
