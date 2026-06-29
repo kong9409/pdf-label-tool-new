@@ -3,13 +3,14 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>PDF 标签处理工具 v20</title>
+  <title>PDF 标签处理工具 by kong v20</title>
   <style>
     :root { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", Arial, sans-serif; color:#172033; background:#f6f7fb; }
     body { margin:0; padding:32px 16px; }
     .wrap { max-width:920px; margin:0 auto; }
     .card { background:#fff; border:1px solid #e6e9f2; border-radius:18px; box-shadow:0 10px 30px rgba(20,30,60,.06); padding:28px; }
     h1 { margin:0 0 8px; font-size:28px; }
+    .byline { font-size:18px; color:#657087; font-weight:700; margin-left:6px; }
     .sub { color:#657087; margin:0 0 24px; line-height:1.7; }
     label { display:block; font-weight:700; margin:18px 0 8px; }
     input[type="file"], select, input[type="number"] { width:100%; box-sizing:border-box; border:1px solid #d7dce8; border-radius:12px; padding:12px; font-size:15px; background:#fff; }
@@ -27,7 +28,7 @@
 <body>
 <div class="wrap">
   <div class="card">
-    <h1>PDF 标签处理工具 v20</h1>
+    <h1>PDF 标签处理工具 <span class="byline">by kong</span></h1>
     <p class="sub">本版优先使用 PDF 文本流替换目的地行的 <b>FBA: 公司名</b> 为 <b>FBA</b>，不再使用横向白框擦除，避免挡住右侧发货地姓名、仓库代码和地址。</p>
 
     <form id="form">
